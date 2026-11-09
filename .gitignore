@@ -1,0 +1,24 @@
+# Build outputs
+/target/
+/skse-plugin/build/
+/skse-plugin/dist/
+/skse-plugin/test-bin/
+/*.exe
+/*.pdb
+*.zip
+
+# Local runtime configuration, state, downloads, drafts, and backups
+/control-center.json
+/.local/
+/runtime/
+/backups/
+/evidence/
+/installation.json
+/verification.json
+
+# Credentials and tokens (defense in depth)
+*.env
+*token*
+*secret*
+*credentials*
+

@@ -1,0 +1,26 @@
+{
+  "musicRoot": "runtime/bard",
+  "feedbackRoot": "runtime/psvr2",
+  "agentPort": 19464,
+  "closeKatOverlays": true,
+  "dependencies": [
+    {"id": "psvr2", "label": "PlayStation VR2 App", "target": "steam://rungameid/2580190", "process": "PlayStationVR2App.exe", "session": true},
+    {"id": "kat", "label": "KAT Gateway", "target": "C:\\Program Files (x86)\\KAT Gateway\\KAT Gateway.exe", "process": "KAT Gateway.exe", "session": true},
+    {"id": "steamvr", "label": "SteamVR", "target": "steam://rungameid/250820", "process": "vrserver.exe", "session": false},
+    {"id": "mo2", "label": "Mod Organizer 2", "target": "C:\\Modding\\MO2\\ModOrganizer.exe", "process": "ModOrganizer.exe", "session": false}
+  ],
+  "nrGuard": {
+    "dllPath": "C:\\Modding\\MO2\\mods\\Open Shaders DLSS5 NR - 0.3.0 TEST\\Shaders\\Upscaling\\Streamline\\nvngx_dlssnr.dll",
+    "communityShadersSettings": "C:\\Modding\\MO2\\overwrite\\SKSE\\Plugins\\CommunityShaders\\SettingsUser.json",
+    "mo2ModsDir": "C:\\Modding\\MO2\\mods",
+    "mo2OverwriteDir": "C:\\Modding\\MO2\\overwrite",
+    "gameDataDir": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SkyrimVR\\Data"
+  },
+  "shaderCache": {
+    "mo2Root": "C:\\Modding\\MO2",
+    "gameDataDir": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SkyrimVR\\Data",
+    "mo2Shortcut": "Launch MGO - Do Not Unlock",
+    "maxBackups": 3
+  }
+}
+

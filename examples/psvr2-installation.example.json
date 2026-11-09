@@ -1,0 +1,9 @@
+{
+  "version": "v1.0.0-experimental-2",
+  "driverDir": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\PlayStation VR2 App\\SteamVR_Plug-In\\bin\\win64",
+  "unitySetup": "tools/HeadsetSetup/PSVR2Toolkit.UnitySetup.exe",
+  "hardwareTester": "tools/CAPIApps/psvr2_toolkit_capi_test.exe",
+  "firmwareChanged": false,
+  "jailbreakPerformed": false
+}
+

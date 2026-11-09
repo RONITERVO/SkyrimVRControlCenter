@@ -1,0 +1,39 @@
+{
+  "lyrics_provider": "openrouter",
+  "selected_model": "z-ai/glm-5.3-flash",
+  "reasoning_effort": "high",
+  "max_output_tokens": 30000,
+  "lyrics_temperature": null,
+  "include_history": true,
+  "history_path": "data/history.turns.json",
+  "voice_mode": "auto",
+  "vocal_gender": "f",
+  "suno_model": "V5_5",
+  "suno_duration_seconds": null,
+  "interval_real_gameplay_seconds": 480,
+  "native_integration_enabled": true,
+  "native_real_interval_override": false,
+  "native_spending_mode": "one_song",
+  "native_recurring_suno_authorization": "",
+  "keep_both_suno_variants": true,
+  "first_response_timeout_seconds": 30,
+  "completion_timeout_seconds": 300,
+  "openrouter_credentials_file": "C:\\Modding\\MO2\\overwrite\\SKSE\\Plugins\\SkyrimNet\\config\\Providers.yaml",
+  "skyrimnet_data": "C:\\Modding\\MO2\\overwrite\\SKSE\\Plugins\\SkyrimNet\\data",
+  "skyrimnet_url": "http://127.0.0.1:8080",
+  "model_profiles": [
+    {
+      "id": "z-ai/glm-5.3-flash",
+      "label": "GLM 5.3 Flash",
+      "enabled": true,
+      "max_price": {"prompt": 0.15, "completion": 0.5, "request": 0}
+    },
+    {
+      "id": "deepseek/deepseek-v3.2",
+      "label": "DeepSeek V3.2",
+      "enabled": false,
+      "max_price": {"prompt": 0.28, "completion": 0.8, "request": 0}
+    }
+  ]
+}
+
