@@ -29,8 +29,8 @@ use tokio::{
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Body = UnsyncBoxBody<Bytes, BoxError>;
 
-pub const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3.8-flash-high";
-pub const DEFAULT_ANTIGRAVITY_EFFORT: &str = "high";
+pub const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3.8-flash-low";
+pub const DEFAULT_ANTIGRAVITY_EFFORT: &str = "low";
 
 /// Resolves the concrete Antigravity model ID based on payload, configured settings, and effort level.
 pub fn resolve_model(
@@ -57,7 +57,7 @@ pub fn resolve_model(
         "medium" | "med" => "medium",
         "high" | "xhigh" | "max" => "high",
         "off" | "none" => "low", // Flash requires minimum low tier
-        _ => "high",
+        _ => "low",
     };
 
     // 3. Resolve base model
@@ -963,15 +963,15 @@ mod tests {
     }
 
     #[test]
-    fn test_default_model_is_gemini_flash_high() {
-        assert_eq!(DEFAULT_ANTIGRAVITY_MODEL, "gemini-3.8-flash-high");
-        assert_eq!(DEFAULT_ANTIGRAVITY_EFFORT, "high");
+    fn test_default_model_is_gemini_flash_low() {
+        assert_eq!(DEFAULT_ANTIGRAVITY_MODEL, "gemini-3.8-flash-low");
+        assert_eq!(DEFAULT_ANTIGRAVITY_EFFORT, "low");
     }
 
     #[test]
     fn test_resolve_model_effort_tiers() {
         let empty_settings = json!({});
-        assert_eq!(resolve_model(None, None, &empty_settings), "gemini-3.8-flash-high");
+        assert_eq!(resolve_model(None, None, &empty_settings), "gemini-3.8-flash-low");
         assert_eq!(resolve_model(None, Some("low"), &empty_settings), "gemini-3.8-flash-low");
         assert_eq!(resolve_model(None, Some("medium"), &empty_settings), "gemini-3.8-flash-medium");
         assert_eq!(resolve_model(None, Some("high"), &empty_settings), "gemini-3.8-flash-high");
@@ -979,11 +979,11 @@ mod tests {
         let custom_settings = json!({
             "antigravity": {
                 "model": "gemini-4-argon",
-                "effort": "low"
+                "effort": "high"
             }
         });
-        assert_eq!(resolve_model(None, None, &custom_settings), "gemini-4-argon-low");
-        assert_eq!(resolve_model(None, Some("high"), &custom_settings), "gemini-4-argon-high");
+        assert_eq!(resolve_model(None, None, &custom_settings), "gemini-4-argon-high");
+        assert_eq!(resolve_model(None, Some("low"), &custom_settings), "gemini-4-argon-low");
         assert_eq!(resolve_model(Some("claude-opus-5-5-high"), None, &custom_settings), "claude-opus-5-5-high");
     }
 }
