@@ -72,3 +72,4 @@ Write-Host "Successfully switched SkyrimNet LLM traffic to Antigravity!" -Foregr
 Write-Host "Updated $modifiedCount provider references to 'local_bard_composer' (port 8097)." -ForegroundColor Gray
 Write-Host "The 'decisions' slot (typesafe/jev-1.13) was preserved on OpenRouter." -ForegroundColor Gray
 Write-Host "To revert at any time, run: scripts\Restore-SkyrimNet-OpenRouter.ps1" -ForegroundColor Yellow
+

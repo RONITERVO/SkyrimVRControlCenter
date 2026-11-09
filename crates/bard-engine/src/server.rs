@@ -141,7 +141,7 @@ async fn handle(
         let (parts, body) = req.into_parts();
         (parts.headers, body)
     };
-    let raw = Limited::new(body, 2_000_000)
+    let raw = Limited::new(body, 4_000_000)
         .collect()
         .await
         .map_err(|_| anyhow::anyhow!("Invalid request size"))?

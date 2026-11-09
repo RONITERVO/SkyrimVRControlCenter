@@ -31,9 +31,11 @@ type Body = UnsyncBoxBody<Bytes, BoxError>;
 
 pub const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3.8-flash-low";
 pub const DEFAULT_SYSTEM_INSTRUCTION: &str =
-    "You are generating raw dialogue / response text for a Skyrim NPC or game system. \
-     Respond ONLY with the direct text/dialogue. Do NOT use tools, do NOT add meta-commentary, \
-     and do NOT wrap your response in markdown code blocks or quotes unless explicitly instructed in the character prompt.";
+    "You are generating raw output for SkyrimNet (Skyrim VR AI). \
+     Respond ONLY with the direct dialogue or JSON requested by the prompt. \
+     Do NOT use tools, do NOT add meta-commentary, preambles, or conversational filler. \
+     Do NOT prefix dialogue with character name headers (such as 'Name: '); output only the direct spoken words or the raw JSON. \
+     Do NOT wrap dialogue in markdown code blocks or quotes unless explicitly instructed in the prompt.";
 
 /// Helper to build an HTTP response from bytes and content-type.
 fn make_response(bytes: impl Into<Bytes>, kind: &str, status: StatusCode) -> Response<Body> {
@@ -318,8 +320,8 @@ impl AntigravityClient {
         Ok(())
     }
 
-    /// Sends a JSON-RPC request to the child process and waits for the response.
-    pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
+    /// Sends a JSON-RPC request to the child process and waits for the response up to timeout_dur.
+    pub async fn call_with_timeout(&self, method: &str, params: Value, timeout_dur: Duration) -> Result<Value> {
         let req_id = self.next_request_id();
         let (tx, rx) = oneshot::channel();
 
@@ -351,16 +353,21 @@ impl AntigravityClient {
             .await
             .map_err(|_| anyhow!("Failed to send to ACP child process stdin"))?;
 
-        match timeout(Duration::from_secs(30), rx).await {
+        match timeout(timeout_dur, rx).await {
             Ok(Ok(Ok(val))) => Ok(val),
             Ok(Ok(Err(err_msg))) => bail!("ACP call '{}' returned error: {}", method, err_msg),
             Ok(Err(_)) => bail!("ACP call '{}' response channel canceled", method),
             Err(_) => {
                 let mut pending = self.pending_requests.lock().await;
                 pending.remove(&req_id);
-                bail!("ACP call '{}' timed out waiting for response", method);
+                bail!("ACP call '{}' timed out after {:?} waiting for response", method, timeout_dur);
             }
         }
+    }
+
+    /// Sends a JSON-RPC request to the child process with a standard 30s timeout.
+    pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_with_timeout(method, params, Duration::from_secs(30)).await
     }
 
     /// Sends a JSON-RPC notification (no response expected).
@@ -451,7 +458,8 @@ impl AntigravityClient {
                 "prompt": prompt
             });
 
-            match client.call("session/prompt", prompt_params).await {
+            // Allow up to 300s for prompt turn (handles 30k tokens and vision encode)
+            match client.call_with_timeout("session/prompt", prompt_params, Duration::from_secs(300)).await {
                 Ok(result) => {
                     if let Some(stop) = result["stopReason"].as_str() {
                         let _ = tx.send(AcpUpdate::StopReason(stop.to_owned()));
@@ -548,6 +556,11 @@ pub fn openai_to_acp(messages: &[Value]) -> Result<(Option<String>, Vec<Value>)>
     let mut prompt_blocks = Vec::new();
     let mut dialogue_transcript = String::new();
 
+    let non_system_count = messages
+        .iter()
+        .filter(|m| m["role"].as_str().unwrap_or("user") != "system")
+        .count();
+
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("user");
         let content = &msg["content"];
@@ -561,13 +574,35 @@ pub fn openai_to_acp(messages: &[Value]) -> Result<(Option<String>, Vec<Value>)>
             continue;
         }
 
+        let explicit_speaker = msg
+            .get("name")
+            .and_then(|n| n.as_str())
+            .filter(|n| !n.trim().is_empty());
+
         // Handle string content
         if let Some(text) = content.as_str() {
-            let speaker = match role {
-                "assistant" => "Assistant",
-                _ => "User",
+            let formatted_turn = match explicit_speaker {
+                Some(s) => format!("{}: {}", s, text),
+                None => {
+                    if non_system_count <= 1 {
+                        text.to_owned()
+                    } else if role == "assistant" {
+                        if text.starts_with("Assistant:") {
+                            text.to_owned()
+                        } else {
+                            format!("Assistant: {}", text)
+                        }
+                    } else if text.starts_with('[') || text.starts_with('*') || text.contains(" (to ") {
+                        text.to_owned()
+                    } else {
+                        format!("User: {}", text)
+                    }
+                }
             };
-            dialogue_transcript.push_str(&format!("{}: {}\n", speaker, text));
+            if !dialogue_transcript.is_empty() {
+                dialogue_transcript.push('\n');
+            }
+            dialogue_transcript.push_str(&formatted_turn);
             continue;
         }
 
@@ -577,11 +612,22 @@ pub fn openai_to_acp(messages: &[Value]) -> Result<(Option<String>, Vec<Value>)>
                 let part_type = part["type"].as_str().unwrap_or("");
                 if part_type == "text" {
                     if let Some(t) = part["text"].as_str() {
-                        let speaker = match role {
-                            "assistant" => "Assistant",
-                            _ => "User",
+                        let formatted_turn = match explicit_speaker {
+                            Some(s) => format!("{}: {}", s, t),
+                            None => {
+                                if non_system_count <= 1 {
+                                    t.to_owned()
+                                } else if role == "assistant" {
+                                    format!("Assistant: {}", t)
+                                } else {
+                                    format!("User: {}", t)
+                                }
+                            }
                         };
-                        dialogue_transcript.push_str(&format!("{}: {}\n", speaker, t));
+                        if !dialogue_transcript.is_empty() {
+                            dialogue_transcript.push('\n');
+                        }
+                        dialogue_transcript.push_str(&formatted_turn);
                     }
                 } else if part_type == "image_url" {
                     if let Some(url) = part["image_url"]["url"].as_str() {

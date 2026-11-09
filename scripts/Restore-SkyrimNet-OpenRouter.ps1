@@ -43,3 +43,4 @@ $destYaml = Join-Path $SkyrimNetConfigDir "OpenRouter.yaml"
 Copy-Item -LiteralPath $sourceYaml -Destination $destYaml -Force
 
 Write-Host "Successfully restored OpenRouter.yaml from: $BackupPath" -ForegroundColor Green
+
