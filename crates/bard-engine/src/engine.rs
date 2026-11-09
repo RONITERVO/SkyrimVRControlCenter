@@ -118,7 +118,13 @@ impl Engine {
         let polling = song_error.is_none()
             && flag(&s, "native_integration_enabled", true)
             && flag(&s, "native_real_interval_override", false);
-        let mut status = json!({"running":true,"runtime":"rust","version":env!("CARGO_PKG_VERSION"),"selected_model":s["selected_model"],"native_custom_preferences":flag(&s,"native_integration_enabled",true),"suno_requests_armed":if flag(&p,"recurring",false){Value::Null}else{p["remaining"].clone()},"ongoing_native_suno_authorized":flag(&p,"recurring",false),"timing":if polling{"real_gameplay_minimum"}else{"native"},"game_polling_enabled":polling,"keep_both_variants":flag(&s,"keep_both_suno_variants",true),"last":state.last,"controls_scope":"new_native_lyrics_only","native_suno_transport":"direct_https","native_suno_proxy_active":false,"can_cancel_submitted_native_music":false,"automatic_secondary_capture":false,"secondary_import":"dashboard_only; no request-gate bypass","settings_path":self.root.join("settings.json")});
+        let backend = text(&s, "llm_backend", "antigravity");
+        let active_model = if backend == "antigravity" {
+            text(&s["antigravity"], "model", crate::antigravity::DEFAULT_ANTIGRAVITY_MODEL)
+        } else {
+            text(&s, "selected_model", "ready")
+        };
+        let mut status = json!({"running":true,"runtime":"rust","version":env!("CARGO_PKG_VERSION"),"llm_backend":backend,"selected_model":active_model,"native_custom_preferences":flag(&s,"native_integration_enabled",true),"suno_requests_armed":if flag(&p,"recurring",false){Value::Null}else{p["remaining"].clone()},"ongoing_native_suno_authorized":flag(&p,"recurring",false),"timing":if polling{"real_gameplay_minimum"}else{"native"},"game_polling_enabled":polling,"keep_both_variants":flag(&s,"keep_both_suno_variants",true),"last":state.last,"controls_scope":"new_native_lyrics_only","native_suno_transport":"direct_https","native_suno_proxy_active":false,"can_cancel_submitted_native_music":false,"automatic_secondary_capture":false,"secondary_import":"dashboard_only; no request-gate bypass","settings_path":self.root.join("settings.json")});
         status["song_configuration_valid"] = json!(song_error.is_none());
         status["song_configuration_error"] = json!(song_error);
         Ok(status)

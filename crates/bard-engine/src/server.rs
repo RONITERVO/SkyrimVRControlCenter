@@ -172,6 +172,12 @@ async fn handle(
         }
         "/v1/chat/completions" | "/chat/completions" => {
             if !is_native_request(&payload) {
+                let root = engine.root.clone();
+                let s = blocking::run(move || read_settings(&root)).await?;
+                let backend = text(&s, "llm_backend", "antigravity");
+                if backend == "antigravity" {
+                    return crate::antigravity::handle_chat_completion(&payload, &s, engine.root.clone()).await;
+                }
                 // Ordinary dialogue does not depend on song profile validity.
                 // Read only the existing credential-file path; leave its payload intact.
                 let key = relay_key(engine.root.clone()).await?;

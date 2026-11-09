@@ -133,7 +133,12 @@ pub fn load_history(root: &Path, s: &Value) -> Result<(Value, Option<String>)> {
     Ok((v, Some(sha(&raw))))
 }
 pub fn build_request(s: &Value, history: &Value, c: &Value) -> Result<Value> {
-    let profile = model_profile(s)?;
+    let profile = if text(s, "lyrics_provider", "openrouter") == "antigravity" {
+        let m = text(&s["antigravity"], "model", crate::antigravity::DEFAULT_ANTIGRAVITY_MODEL);
+        json!({"id": m, "label": m, "enabled": true})
+    } else {
+        model_profile(s)?
+    };
     let include = flag(s, "include_history", true);
     let mut system = SYSTEM.to_owned();
     if !include {

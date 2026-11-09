@@ -228,14 +228,56 @@ pub async fn make_draft(
     }
     std::fs::create_dir_all(&destination)?;
     save_json(&destination.join("context.json"), &context)?;
-    let evidence = json!({"provider":"openrouter","requested_model":request["model"],"model":request["model"],"reasoning_effort":text(s,"reasoning_effort","high"),"history_included":flag(s,"include_history",true),"history_turns":history.as_array().map_or(0,Vec::len),"message_count":request["messages"].as_array().map_or(0,Vec::len),"input_characters":request["messages"].as_array().unwrap().iter().map(|m|m["content"].as_str().unwrap().chars().count()).sum::<usize>(),"first_content_seconds":null,"first_content_kind":null,"reasoning_characters":0,"max_tokens":request["max_tokens"],"temperature":request["temperature"],"first_response_timeout_seconds":num(s,"first_response_timeout_seconds",30.0),"completion_timeout_seconds":num(s,"completion_timeout_seconds",300.0),"new_length_instructions":false,"automatic_retry":false,"suno_submitted":false,"runtime":"rust"});
+    let evidence_provider = if text(s, "lyrics_provider", "openrouter") == "antigravity" { "antigravity" } else { "openrouter" };
+    let evidence = json!({"provider":evidence_provider,"requested_model":request["model"],"model":request["model"],"reasoning_effort":text(s,"reasoning_effort","high"),"history_included":flag(s,"include_history",true),"history_turns":history.as_array().map_or(0,Vec::len),"message_count":request["messages"].as_array().map_or(0,Vec::len),"input_characters":request["messages"].as_array().unwrap().iter().map(|m|m["content"].as_str().unwrap().chars().count()).sum::<usize>(),"first_content_seconds":null,"first_content_kind":null,"reasoning_characters":0,"max_tokens":request["max_tokens"],"temperature":request["temperature"],"first_response_timeout_seconds":num(s,"first_response_timeout_seconds",30.0),"completion_timeout_seconds":num(s,"completion_timeout_seconds",300.0),"new_length_instructions":false,"automatic_retry":false,"suno_submitted":false,"runtime":"rust"});
     Ok((context, history_hash, request, destination, evidence))
     }).await?;
     let started = Instant::now();
+    let provider = text(&s, "lyrics_provider", "openrouter").to_owned();
+    let provider_name = provider.clone();
+    let lyrics_root = root.clone();
+    let lyrics_s = s.clone();
     let result = async {
-        let key_settings = s.clone();
-        let key = blocking::run(move || openrouter_key(&key_settings)).await?;
-        stream_call(&client()?, OPENROUTER, &key, &request, &s, &mut evidence).await
+        if provider_name == "antigravity" {
+            let sandbox_dir = lyrics_s["antigravity"]["sandbox_dir"]
+                .as_str()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| lyrics_root.join("agy-sandbox"));
+            let agy_path = lyrics_s["antigravity"]["agy_path"].as_str().map(str::to_owned);
+            let client = crate::antigravity::get_client(sandbox_dir, agy_path);
+            let target_model = text(&lyrics_s["antigravity"], "model", crate::antigravity::DEFAULT_ANTIGRAVITY_MODEL);
+            let messages = request["messages"].as_array().context("Invalid messages array")?;
+            let (system_prompt, prompt_blocks) = crate::antigravity::openai_to_acp(messages)?;
+            let session_id = client.new_session(target_model, system_prompt.as_deref()).await?;
+            let timeout_secs = num(&lyrics_s, "completion_timeout_seconds", 300.0);
+            let (full_text, usage) = client.prompt_buffered(&session_id, prompt_blocks, Duration::from_secs_f64(timeout_secs)).await?;
+
+            let clean_json = if let Some(start) = full_text.find('{') {
+                if let Some(end) = full_text.rfind('}') {
+                    &full_text[start..=end]
+                } else {
+                    full_text.as_str()
+                }
+            } else {
+                full_text.as_str()
+            };
+
+            let song = normalize_directions(
+                serde_json::from_str(clean_json).context("Model answer is not a complete JSON song")?,
+            )?;
+            evidence["provider"] = json!("antigravity");
+            evidence["model"] = json!(target_model);
+            evidence["elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
+            evidence["success"] = json!(true);
+            evidence["song_title"] = song["title"].clone();
+            evidence["sung_word_count"] = song["sung_word_count"].clone();
+            evidence["usage"] = usage;
+            Ok((song, clean_json.to_owned()))
+        } else {
+            let key_settings = s.clone();
+            let key = blocking::run(move || openrouter_key(&key_settings)).await?;
+            stream_call(&client()?, OPENROUTER, &key, &request, &s, &mut evidence).await
+        }
     }
     .await;
     let (song, raw) = match result {
@@ -260,7 +302,7 @@ pub async fn make_draft(
     save_json(&destination.join("result.json"), &evidence)?;
     save_json(
         &destination.join("request-metadata.json"),
-            &json!({"provider":"openrouter","model":request["model"],"reasoning_effort":text(s,"reasoning_effort","high"),"history_included":flag(s,"include_history",true),"history_turns":evidence["history_turns"],"history_sha256":history_hash,"message_count":evidence["message_count"],"new_length_instructions":false,"voice_control":context["voice_control"],"suno_duration_sent_to_lyrics_model":false,"suno_submitted":false,"runtime":"rust"}),
+            &json!({"provider":evidence["provider"].as_str().unwrap_or("openrouter"),"model":evidence["model"],"reasoning_effort":text(s,"reasoning_effort","high"),"history_included":flag(s,"include_history",true),"history_turns":evidence["history_turns"],"history_sha256":history_hash,"message_count":evidence["message_count"],"new_length_instructions":false,"voice_control":context["voice_control"],"suno_duration_sent_to_lyrics_model":false,"suno_submitted":false,"runtime":"rust"}),
     )?;
     std::fs::write(destination.join("review.md"),format!("# {}\n\nStyle: {}\n\nVoice: {}\n\n{}\n\nArrangement: {}\n\nModel: {}; thinking: {}; history turns: {}. First content {} s ({}); complete {} s.\n\nNo Suno request has been sent. A paid test needs explicit approval of these lyrics.\n",text(&song,"title",""),text(&song,"style",""),text(&song,"vocal_gender",""),text(&song,"lyrics",""),text(&song,"arrangement_notes",""),text(&evidence,"model",""),text(&evidence,"reasoning_effort",""),evidence["history_turns"],evidence["first_content_seconds"],text(&evidence,"first_content_kind",""),evidence["elapsed_seconds"]))?;
     save_json(

@@ -28,6 +28,22 @@ After editing any Rust code under `crates\`, rebuild, test, lint, and stage both
 
 *(Close the Control Center UI and stop `skyrim-bard-engine.exe` outside a Skyrim session before replacing running `.exe` files.)*
 
+## Antigravity LLM Integration (Zero-Credit NPC & Bard Inference)
+
+To route all SkyrimNet NPC dialogue, combat, actions, vision, and Bard lyrics to local Antigravity (`gemini-3.8-flash-low`) instead of OpenRouter:
+
+```powershell
+.\scripts\Switch-SkyrimNet-To-Antigravity.ps1
+```
+
+*(Ensure Skyrim VR and Mod Organizer 2 are closed beforehand.)*
+
+- The `decisions` slot remains on OpenRouter (`openrouter_decisions`) with `typesafe/jev-1.13`.
+- All other SkyrimNet slots route through the local relay on `127.0.0.1:8097` using `agy acp`.
+- To switch back to OpenRouter at any time:
+  - In `runtime\bard\settings.json`: set `"llm_backend": "openrouter"`.
+  - Or run: `.\scripts\Restore-SkyrimNet-OpenRouter.ps1`.
+
 ## Both song variants
 
 Open **Song downloads** in the panel. Automatic saving uses your enabled both-variants preference, and **Download new variants** performs a one-time scan of existing requests without generating music. Files are saved under `runtime\bard\Song Downloads`, separated into **Already cached by SkyrimNet**, **To import into SkyrimNet**, and **Unconfirmed**, each with matching YAML metadata for SkyrimNet's Voice / Bards / Songs import page.
