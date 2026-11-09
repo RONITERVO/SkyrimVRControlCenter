@@ -29,7 +29,50 @@ use tokio::{
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Body = UnsyncBoxBody<Bytes, BoxError>;
 
-pub const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3.8-flash-low";
+pub const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3.8-flash-high";
+pub const DEFAULT_ANTIGRAVITY_EFFORT: &str = "high";
+
+/// Resolves the concrete Antigravity model ID based on payload, configured settings, and effort level.
+pub fn resolve_model(
+    payload_model: Option<&str>,
+    payload_effort: Option<&str>,
+    settings: &Value,
+) -> String {
+    // 1. If payload explicitly specifies an exact Antigravity model ID, use it directly
+    if let Some(m) = payload_model {
+        let m_clean = m.trim();
+        if m_clean.starts_with("gemini-") || m_clean.starts_with("claude-") || m_clean.starts_with("gpt-oss-") {
+            return m_clean.to_string();
+        }
+    }
+
+    // 2. Resolve effort level
+    let effort_raw = payload_effort
+        .or_else(|| settings["antigravity"]["effort"].as_str())
+        .or_else(|| settings["reasoning_effort"].as_str())
+        .unwrap_or(DEFAULT_ANTIGRAVITY_EFFORT);
+
+    let effort_tier = match effort_raw.to_lowercase().as_str() {
+        "low" | "minimal" => "low",
+        "medium" | "med" => "medium",
+        "high" | "xhigh" | "max" => "high",
+        "off" | "none" => "low", // Flash requires minimum low tier
+        _ => "high",
+    };
+
+    // 3. Resolve base model
+    let configured_model = settings["antigravity"]["model"]
+        .as_str()
+        .unwrap_or(DEFAULT_ANTIGRAVITY_MODEL);
+
+    let base = configured_model
+        .strip_suffix("-low")
+        .or_else(|| configured_model.strip_suffix("-medium"))
+        .or_else(|| configured_model.strip_suffix("-high"))
+        .unwrap_or(configured_model);
+
+    format!("{}-{}", base, effort_tier)
+}
 pub const DEFAULT_SYSTEM_INSTRUCTION: &str =
     "You are generating raw output for SkyrimNet (Skyrim VR AI). \
      Respond ONLY with the direct dialogue or JSON requested by the prompt. \
@@ -101,6 +144,7 @@ pub fn find_agy_path(configured_path: Option<&str>) -> Result<PathBuf> {
 #[derive(Debug, Clone)]
 pub enum AcpUpdate {
     Chunk(String),
+    Thought(String),
     StopReason(String),
     Usage(Value),
     Completed,
@@ -272,6 +316,10 @@ impl AntigravityClient {
                             if update_kind == "agent_message_chunk" {
                                 if let Some(text) = update["content"]["text"].as_str() {
                                     let _ = s.sender.send(AcpUpdate::Chunk(text.to_owned()));
+                                }
+                            } else if update_kind == "agent_thought_chunk" {
+                                if let Some(text) = update["content"]["text"].as_str() {
+                                    let _ = s.sender.send(AcpUpdate::Thought(text.to_owned()));
                                 }
                             }
                         }
@@ -490,21 +538,23 @@ impl AntigravityClient {
         Ok(rx)
     }
 
-    /// Non-streaming prompt execution: buffers all chunks and returns complete string & usage.
+    /// Non-streaming prompt execution: buffers all chunks and returns complete string, optional reasoning & usage.
     pub async fn prompt_buffered(
         self: Arc<Self>,
         session_id: &str,
         prompt: Vec<Value>,
         timeout_duration: Duration,
-    ) -> Result<(String, Value)> {
+    ) -> Result<(String, Option<String>, Value)> {
         let mut rx = self.clone().prompt_stream(session_id, prompt).await?;
         let mut full_text = String::new();
+        let mut full_thought = String::new();
         let mut usage = json!({});
 
         let res = timeout(timeout_duration, async {
             while let Some(update) = rx.recv().await {
                 match update {
                     AcpUpdate::Chunk(c) => full_text.push_str(&c),
+                    AcpUpdate::Thought(t) => full_thought.push_str(&t),
                     AcpUpdate::Usage(u) => usage = u,
                     AcpUpdate::Completed => break,
                     AcpUpdate::Error(err) => bail!("ACP prompt failed: {}", err),
@@ -516,7 +566,14 @@ impl AntigravityClient {
         .await;
 
         match res {
-            Ok(Ok(())) => Ok((full_text, usage)),
+            Ok(Ok(())) => {
+                let thought_opt = if full_thought.is_empty() {
+                    None
+                } else {
+                    Some(full_thought)
+                };
+                Ok((full_text, thought_opt, usage))
+            }
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 // Cancel prompt
@@ -690,10 +747,11 @@ pub async fn handle_chat_completion(
         .as_array()
         .ok_or_else(|| anyhow!("Request messages must be an array"))?;
 
-    // Determine target model
-    let target_model = settings["antigravity"]["model"]
-        .as_str()
-        .unwrap_or(DEFAULT_ANTIGRAVITY_MODEL);
+    // Determine target model and effort
+    let payload_model = payload["model"].as_str();
+    let payload_effort = payload["reasoning_effort"].as_str();
+    let resolved_model = resolve_model(payload_model, payload_effort, settings);
+    let target_model = &resolved_model;
 
     let configured_path = settings["antigravity"]["agy_path"]
         .as_str()
@@ -811,14 +869,21 @@ pub async fn handle_chat_completion(
         // Non-streaming
         let timeout_secs = settings["completion_timeout_seconds"]
             .as_f64()
-            .unwrap_or(120.0);
+            .unwrap_or(300.0);
         let res = client
             .clone()
             .prompt_buffered(&session_id, prompt_blocks, Duration::from_secs_f64(timeout_secs))
             .await;
 
         match res {
-            Ok((full_text, usage)) => {
+            Ok((full_text, full_thought, usage)) => {
+                let mut message = json!({
+                    "role": "assistant",
+                    "content": full_text
+                });
+                if let Some(thought) = full_thought {
+                    message["reasoning_content"] = json!(thought);
+                }
                 let completion = json!({
                     "id": format!("chatcmpl-{}", created_ts),
                     "object": "chat.completion",
@@ -826,10 +891,7 @@ pub async fn handle_chat_completion(
                     "model": model_name,
                     "choices": [{
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": full_text
-                        },
+                        "message": message,
                         "finish_reason": "stop"
                     }],
                     "usage": usage
@@ -901,7 +963,27 @@ mod tests {
     }
 
     #[test]
-    fn test_default_model_is_gemini_flash_low() {
-        assert_eq!(DEFAULT_ANTIGRAVITY_MODEL, "gemini-3.8-flash-low");
+    fn test_default_model_is_gemini_flash_high() {
+        assert_eq!(DEFAULT_ANTIGRAVITY_MODEL, "gemini-3.8-flash-high");
+        assert_eq!(DEFAULT_ANTIGRAVITY_EFFORT, "high");
+    }
+
+    #[test]
+    fn test_resolve_model_effort_tiers() {
+        let empty_settings = json!({});
+        assert_eq!(resolve_model(None, None, &empty_settings), "gemini-3.8-flash-high");
+        assert_eq!(resolve_model(None, Some("low"), &empty_settings), "gemini-3.8-flash-low");
+        assert_eq!(resolve_model(None, Some("medium"), &empty_settings), "gemini-3.8-flash-medium");
+        assert_eq!(resolve_model(None, Some("high"), &empty_settings), "gemini-3.8-flash-high");
+
+        let custom_settings = json!({
+            "antigravity": {
+                "model": "gemini-4-argon",
+                "effort": "low"
+            }
+        });
+        assert_eq!(resolve_model(None, None, &custom_settings), "gemini-4-argon-low");
+        assert_eq!(resolve_model(None, Some("high"), &custom_settings), "gemini-4-argon-high");
+        assert_eq!(resolve_model(Some("claude-opus-5-5-high"), None, &custom_settings), "claude-opus-5-5-high");
     }
 }

@@ -275,7 +275,7 @@ impl App {
             self.label(
                 0,
                 101,
-                "Active LLM model (Antigravity: gemini-3.8-flash-low / OpenRouter author/model ID)",
+                "Active LLM model (Antigravity: gemini-3.8-flash-high (default) / low / med / OpenRouter ID)",
                 26,
                 240,
                 500,

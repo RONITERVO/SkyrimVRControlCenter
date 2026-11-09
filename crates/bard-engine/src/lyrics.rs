@@ -245,12 +245,12 @@ pub async fn make_draft(
                 .unwrap_or_else(|| lyrics_root.join("agy-sandbox"));
             let agy_path = lyrics_s["antigravity"]["agy_path"].as_str().map(str::to_owned);
             let client = crate::antigravity::get_client(sandbox_dir, agy_path);
-            let target_model = text(&lyrics_s["antigravity"], "model", crate::antigravity::DEFAULT_ANTIGRAVITY_MODEL);
+            let resolved_model = crate::antigravity::resolve_model(request["model"].as_str(), lyrics_s["antigravity"]["effort"].as_str(), &lyrics_s);
             let messages = request["messages"].as_array().context("Invalid messages array")?;
             let (system_prompt, prompt_blocks) = crate::antigravity::openai_to_acp(messages)?;
-            let session_id = client.new_session(target_model, system_prompt.as_deref()).await?;
+            let session_id = client.new_session(&resolved_model, system_prompt.as_deref()).await?;
             let timeout_secs = num(&lyrics_s, "completion_timeout_seconds", 300.0);
-            let (full_text, usage) = client.prompt_buffered(&session_id, prompt_blocks, Duration::from_secs_f64(timeout_secs)).await?;
+            let (full_text, _, usage) = client.prompt_buffered(&session_id, prompt_blocks, Duration::from_secs_f64(timeout_secs)).await?;
 
             let clean_json = if let Some(start) = full_text.find('{') {
                 if let Some(end) = full_text.rfind('}') {
@@ -266,7 +266,7 @@ pub async fn make_draft(
                 serde_json::from_str(clean_json).context("Model answer is not a complete JSON song")?,
             )?;
             evidence["provider"] = json!("antigravity");
-            evidence["model"] = json!(target_model);
+            evidence["model"] = json!(resolved_model);
             evidence["elapsed_seconds"] = json!(started.elapsed().as_secs_f64());
             evidence["success"] = json!(true);
             evidence["song_title"] = song["title"].clone();
