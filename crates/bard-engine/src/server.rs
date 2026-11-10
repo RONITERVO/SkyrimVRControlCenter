@@ -94,6 +94,118 @@ async fn relay_key(root: PathBuf) -> Result<String> {
     // No credential cache: a pool can survive a key/settings change safely.
     blocking::run(move || openrouter_key(&read_settings(&root)?)).await
 }
+fn has_image_content(payload: &Value) -> bool {
+    payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|msg| {
+                msg.get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("image_url")
+                                || part.get("image_url").is_some()
+                        })
+                    })
+            })
+        })
+}
+fn is_google_or_non_openrouter_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized.is_empty()
+        || normalized.starts_with("google/")
+        || normalized.starts_with("gemini-")
+        || normalized.starts_with("claude-")
+        || normalized.starts_with("gpt-oss-")
+        || !normalized.contains('/')
+}
+fn strip_google_extra_body(body: &mut Value) {
+    if let Some(extra) = body.get_mut("extra_body").and_then(Value::as_object_mut) {
+        extra.remove("google");
+        if let Some(nested) = extra.get_mut("extra_body").and_then(Value::as_object_mut) {
+            nested.remove("google");
+        }
+        if extra
+            .get("extra_body")
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            extra.remove("extra_body");
+        }
+    }
+    if body
+        .get("extra_body")
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("extra_body");
+        }
+    }
+}
+fn openrouter_fallback_body(payload: &Value) -> Result<Bytes> {
+    let mut body = payload.clone();
+    let original_model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let keep_multimodal_slug = has_image_content(payload) && original_model.contains('/');
+    if !keep_multimodal_slug && is_google_or_non_openrouter_model(original_model) {
+        body["model"] = json!(crate::antigravity::DEFAULT_OPENROUTER_FALLBACK_MODEL);
+        strip_google_extra_body(&mut body);
+    }
+    Ok(Bytes::from(serde_json::to_vec(&body)?))
+}
+async fn fallback_to_openrouter(
+    payload: &Value,
+    headers: hyper::HeaderMap,
+    root: PathBuf,
+    openrouter_endpoint: &str,
+    policy_reason: &str,
+) -> Result<Response<Body>> {
+    match relay_key(root).await {
+        Ok(key) => {
+            let rewritten = openrouter_fallback_body(payload)?;
+            relay(rewritten, headers, lyrics::client()?, key, openrouter_endpoint).await
+        }
+        Err(_) => Ok(json_response(
+            &json!({
+                "error": {
+                    "message": policy_reason,
+                    "type": "upstream_policy_error",
+                    "code": "antigravity_policy_blocked"
+                }
+            }),
+            StatusCode::BAD_GATEWAY,
+        )),
+    }
+}
+async fn handle_non_native_chat(
+    raw: Bytes,
+    payload: &Value,
+    headers: hyper::HeaderMap,
+    root: PathBuf,
+    openrouter_endpoint: &str,
+) -> Result<Response<Body>> {
+    let settings_root = root.clone();
+    let s = blocking::run(move || read_settings(&settings_root)).await?;
+    let backend = text(&s, "llm_backend", "antigravity");
+    if backend == "antigravity" {
+        match crate::antigravity::try_chat_completion(payload, &s, root.clone()).await? {
+            crate::antigravity::CompletionResult::Response(resp) => return Ok(resp),
+            crate::antigravity::CompletionResult::PolicyBlocked(reason) => {
+                return fallback_to_openrouter(payload, headers, root, openrouter_endpoint, &reason)
+                    .await;
+            }
+        }
+    }
+    // Ordinary dialogue does not depend on song profile validity.
+    // Read only the existing credential-file path; leave its payload intact.
+    let key = relay_key(root).await?;
+    relay(raw, headers, lyrics::client()?, key, openrouter_endpoint).await
+}
 async fn handle(
     req: Request<Incoming>,
     engine: Arc<Engine>,
@@ -176,16 +288,14 @@ async fn handle(
         }
         "/v1/chat/completions" | "/chat/completions" => {
             if !is_native_request(&payload) {
-                let root = engine.root.clone();
-                let s = blocking::run(move || read_settings(&root)).await?;
-                let backend = text(&s, "llm_backend", "antigravity");
-                if backend == "antigravity" {
-                    return crate::antigravity::handle_chat_completion(&payload, &s, engine.root.clone()).await;
-                }
-                // Ordinary dialogue does not depend on song profile validity.
-                // Read only the existing credential-file path; leave its payload intact.
-                let key = relay_key(engine.root.clone()).await?;
-                return relay(raw, headers, lyrics::client()?, key, OPENROUTER).await;
+                return handle_non_native_chat(
+                    raw,
+                    &payload,
+                    headers,
+                    engine.root.clone(),
+                    OPENROUTER,
+                )
+                .await;
             }
             let answer = engine.compose(&payload).await?;
             let root = engine.root.clone();
@@ -465,5 +575,257 @@ mod tests {
         assert_eq!(fast.unwrap(), "fast");
         assert_eq!(body.collect().await.unwrap().to_bytes(), "last!");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn openrouter_fallback_body_rewrites_google_and_preserves_other_models() {
+        let google_payload = json!({
+            "model": "google/gemma-4-31b-it",
+            "messages": [{"role": "user", "content": "Tell me a tale."}],
+            "stream": true,
+            "extra_body": {
+                "google": {"safety_settings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}]},
+                "extra_body": {
+                    "google": {"safety_settings": []}
+                },
+                "keep_other": 42
+            }
+        });
+        let rewritten: Value =
+            serde_json::from_slice(&openrouter_fallback_body(&google_payload).unwrap()).unwrap();
+        assert_eq!(
+            rewritten["model"],
+            crate::antigravity::DEFAULT_OPENROUTER_FALLBACK_MODEL
+        );
+        assert!(rewritten["extra_body"].get("google").is_none());
+        assert!(rewritten["extra_body"].get("extra_body").is_none());
+        assert_eq!(rewritten["extra_body"]["keep_other"], 42);
+
+        for alias in [
+            "gemini-3.8-flash-low",
+            "claude-sonnet-4-5",
+            "gpt-oss-120b-medium",
+            "local-alias",
+        ] {
+            let payload = json!({
+                "model": alias,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "extra_body": { "google": { "thinking_config": { "thinking_budget": 0 } } }
+            });
+            let parsed: Value =
+                serde_json::from_slice(&openrouter_fallback_body(&payload).unwrap()).unwrap();
+            assert_eq!(
+                parsed["model"],
+                crate::antigravity::DEFAULT_OPENROUTER_FALLBACK_MODEL
+            );
+            assert!(parsed.get("extra_body").is_none());
+        }
+
+        let qwen_payload = json!({
+            "model": "qwen/qwen3-235b-a22b-2507",
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        let qwen_parsed: Value =
+            serde_json::from_slice(&openrouter_fallback_body(&qwen_payload).unwrap()).unwrap();
+        assert_eq!(qwen_parsed["model"], "qwen/qwen3-235b-a22b-2507");
+
+        let multimodal_payload = json!({
+            "model": "google/gemma-4-26b-a4b-it",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe what the Dragonborn sees."},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA="}}
+                ]
+            }]
+        });
+        let multimodal_parsed: Value =
+            serde_json::from_slice(&openrouter_fallback_body(&multimodal_payload).unwrap()).unwrap();
+        assert_eq!(multimodal_parsed["model"], "google/gemma-4-26b-a4b-it");
+    }
+
+    #[tokio::test]
+    async fn fallback_to_openrouter_relays_rewritten_payload_when_key_present() {
+        use std::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let seen_server = seen.clone();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |req: Request<Incoming>| {
+                let seen_server = seen_server.clone();
+                async move {
+                    let auth = req.headers()["authorization"].to_str().unwrap().to_owned();
+                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                    let json_body: Value = serde_json::from_slice(&body).unwrap();
+                    seen_server.lock().unwrap().push((auth, json_body));
+                    let mut result = response(
+                        "data: fallback-ok\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                        StatusCode::OK,
+                    );
+                    result
+                        .headers_mut()
+                        .insert("connection", "close".parse().unwrap());
+                    Ok::<_, Infallible>(result)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), service)
+                .await;
+        });
+
+        let fixture = tempfile::tempdir().unwrap();
+        let providers = fixture.path().join("Providers.yaml");
+        std::fs::write(
+            &providers,
+            "providers:\n  - id: openrouter\n    api_key: sk-or-fixture-fallback\n",
+        )
+        .unwrap();
+        save_json(
+            &fixture.path().join("settings.json"),
+            &json!({"openrouter_credentials_file": providers}),
+        )
+        .unwrap();
+
+        let payload = json!({
+            "model": "google/gemma-4-31b-it",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "extra_body": {"google": {"safety_settings": []}}
+        });
+        let resp = fallback_to_openrouter(
+            &payload,
+            hyper::HeaderMap::new(),
+            fixture.path().to_path_buf(),
+            &endpoint,
+            "The prompt could not be submitted",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), b"data: fallback-ok\n\ndata: [DONE]\n\n");
+        server.await.unwrap();
+
+        let recorded = seen.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "Bearer sk-or-fixture-fallback");
+        assert_eq!(
+            recorded[0].1["model"],
+            crate::antigravity::DEFAULT_OPENROUTER_FALLBACK_MODEL
+        );
+        assert!(recorded[0].1.get("extra_body").is_none());
+    }
+
+    #[tokio::test]
+    async fn fallback_to_openrouter_returns_502_when_key_missing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let server = tokio::spawn(async move {
+            if let Ok((_socket, _)) = listener.accept().await {
+                hits_server.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let fixture = tempfile::tempdir().unwrap();
+        let missing_providers = fixture.path().join("Providers.yaml");
+        save_json(
+            &fixture.path().join("settings.json"),
+            &json!({"openrouter_credentials_file": missing_providers}),
+        )
+        .unwrap();
+
+        let payload = json!({
+            "model": "google/gemma-4-31b-it",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        let resp = fallback_to_openrouter(
+            &payload,
+            hyper::HeaderMap::new(),
+            fixture.path().to_path_buf(),
+            &endpoint,
+            "The prompt could not be submitted",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["error"]["code"], "antigravity_policy_blocked");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("The prompt could not be submitted"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn handle_non_native_chat_relays_raw_when_openrouter_backend_selected() {
+        use std::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::<Bytes>::new()));
+        let seen_server = seen.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |req: Request<Incoming>| {
+                let seen_server = seen_server.clone();
+                async move {
+                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                    seen_server.lock().unwrap().push(body);
+                    let mut result = response("ok", "application/json", StatusCode::OK);
+                    result
+                        .headers_mut()
+                        .insert("connection", "close".parse().unwrap());
+                    Ok::<_, Infallible>(result)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), service)
+                .await;
+        });
+
+        let fixture = tempfile::tempdir().unwrap();
+        let providers = fixture.path().join("Providers.yaml");
+        std::fs::write(
+            &providers,
+            "providers:\n  - id: openrouter\n    api_key: sk-or-fixture-direct\n",
+        )
+        .unwrap();
+        save_json(
+            &fixture.path().join("settings.json"),
+            &json!({
+                "llm_backend": "openrouter",
+                "openrouter_credentials_file": providers
+            }),
+        )
+        .unwrap();
+
+        let raw = Bytes::from_static(b"{ \"model\" : \"google/gemma-4-31b-it\" }");
+        let payload: Value = serde_json::from_slice(&raw).unwrap();
+        let resp = handle_non_native_chat(
+            raw.clone(),
+            &payload,
+            hyper::HeaderMap::new(),
+            fixture.path().to_path_buf(),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), b"ok");
+        server.await.unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), &[raw]);
     }
 }
