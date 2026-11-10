@@ -1,5 +1,11 @@
 {
-  "lyrics_provider": "openrouter",
+  "llm_backend": "antigravity",
+  "lyrics_provider": "antigravity",
+  "antigravity": {
+    "model": "gemini-3.8-flash-low",
+    "agy_path": null,
+    "sandbox_dir": null
+  },
   "selected_model": "z-ai/glm-5.3-flash",
   "reasoning_effort": "high",
   "max_output_tokens": 30000,

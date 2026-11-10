@@ -78,6 +78,17 @@ The archive API transport permits only GET task details, GET credits, GET recove
 
 `poll-existing --draft <directory>` resumes a known `suno-submission.json` task ID without generating another song. `download-existing --draft <directory>` downloads all variants from a completed result, retains each original MP3, measures duration with `ffprobe`, fully decodes it with `ffmpeg`, and writes `audio-verification.json`. These two installed command-line tools are required for audio verification. Downloads do not follow redirects, send provider keys to audio URLs, trim, regenerate, or import audio.
 
+## Antigravity ACP Backend
+
+Version 0.2.1 introduces a native Antigravity ACP (`agy acp`) backend:
+
+- **Zero-Credit Local Inference**: Routes SkyrimNet NPC dialogue, combat, actions, vision, and Bard lyrics through the local Antigravity CLI without consuming OpenRouter credits.
+- **Fast Response**: Uses persistent JSON-RPC over `stdio` to the `agy acp` server. Requests execute in ~2–3 seconds on `gemini-3.8-flash-low`.
+- **Strict Headless Safety**: Automatically auto-denies tool execution and workspace access requests from the agent, guaranteeing zero side effects on the host filesystem.
+- **Full OpenAI API Compatibility**: Emits standard SSE streaming chunk deltas (`chat.completion.chunk`) and complete responses (`chat.completion`), including vision base64 image parsing.
+- **Seamless OpenRouter Fallback**: Set `"llm_backend": "openrouter"` in `settings.json` (or via the Control Center UI) to revert all relay traffic back to OpenRouter.
+- **SkyrimNet Route Automation**: Run `scripts\Switch-SkyrimNet-To-Antigravity.ps1` to route SkyrimNet variants to the relay on port 8097 while keeping the `decisions` slot on OpenRouter (`openrouter_decisions`). Revert at any time with `scripts\Restore-SkyrimNet-OpenRouter.ps1`.
+
 ## Deliberate limits
 
 This port implements the current OpenRouter native integration and explicit reviewed delivery workflow. It does not implement the superseded Gemini key rotation, raw history export conversion, external draft/paid schedulers, route installation/rollback, SQLite scanning, or dashboard automation. It refuses unsupported provider settings. Existing cleaned history must be available.

@@ -87,10 +87,17 @@ pub fn model_profile(s: &Value) -> Result<Value> {
     Ok(selected.unwrap_or_else(|| json!({"id":id,"label":id,"enabled":true})))
 }
 pub fn validate(s: &Value) -> Result<()> {
-    if text(s, "lyrics_provider", "openrouter") != "openrouter" {
-        bail!("Rust engine currently supports the selected OpenRouter workflow only");
+    let provider = text(s, "lyrics_provider", "openrouter");
+    if provider != "openrouter" && provider != "antigravity" {
+        bail!("Rust engine currently supports the selected OpenRouter or Antigravity workflows only");
     }
-    model_profile(s)?;
+    let backend = text(s, "llm_backend", "antigravity");
+    if backend != "openrouter" && backend != "antigravity" {
+        bail!("llm_backend must be openrouter or antigravity");
+    }
+    if provider == "openrouter" {
+        model_profile(s)?;
+    }
     if !["off", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&text(
         s,
         "reasoning_effort",

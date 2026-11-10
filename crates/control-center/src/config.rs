@@ -213,6 +213,8 @@ pub const MUSIC_KEYS: &[&str] = &[
     "interval_real_gameplay_seconds",
     "native_real_interval_override",
     "keep_both_suno_variants",
+    "llm_backend",
+    "antigravity",
 ];
 pub fn public_music(v: &Value) -> Value {
     let mut result = json!({});
@@ -273,6 +275,9 @@ pub fn patch_music(current: &Value, patch: &Value) -> Result<Value> {
         if id == model && p["enabled"] != true {
             return Err("Selected song model is disabled; enable it first".into());
         }
+    }
+    if v["llm_backend"].as_str().is_some_and(|b| b != "antigravity" && b != "openrouter") {
+        return Err("llm_backend must be antigravity or openrouter".into());
     }
     if !["off", "minimal", "low", "medium", "high", "xhigh", "max"]
         .contains(&v["reasoning_effort"].as_str().unwrap_or(""))
