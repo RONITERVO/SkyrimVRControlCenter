@@ -31,6 +31,55 @@ type Body = UnsyncBoxBody<Bytes, BoxError>;
 
 pub const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3.8-flash-low";
 pub const DEFAULT_ANTIGRAVITY_EFFORT: &str = "low";
+pub const DEFAULT_OPENROUTER_FALLBACK_MODEL: &str = "deepseek/deepseek-v3.2";
+
+const POLICY_BLOCK_PREFIXES: &[&str] = &[
+    "the prompt could not be submitted",
+    "the prompt contains sensitive words",
+    "generative ai prohibited use policy",
+    "your previous response was blocked by content safety filters",
+    "blocked by content safety filters",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixCheck {
+    NeedMore,
+    PassThrough,
+    PolicyBlocked,
+}
+
+fn normalize_policy_probe(text: &str) -> String {
+    text.trim_start_matches(|c: char| c.is_whitespace() || c == '⚠' || c == '\u{fe0f}')
+        .to_ascii_lowercase()
+}
+
+/// Classifies an accumulated leading chunk buffer before committing HTTP 200 SSE headers.
+pub fn classify_policy_prefix(text: &str) -> PrefixCheck {
+    let norm = normalize_policy_probe(text);
+    if norm.is_empty() {
+        return PrefixCheck::NeedMore;
+    }
+    if POLICY_BLOCK_PREFIXES
+        .iter()
+        .any(|prefix| norm.starts_with(prefix))
+        || norm.contains("generative ai prohibited use policy")
+        || norm.contains("policies.google.com/terms/generative-ai/use-policy")
+    {
+        return PrefixCheck::PolicyBlocked;
+    }
+    if norm.len() < 128
+        && POLICY_BLOCK_PREFIXES
+            .iter()
+            .any(|prefix| prefix.starts_with(&norm))
+    {
+        return PrefixCheck::NeedMore;
+    }
+    PrefixCheck::PassThrough
+}
+
+pub fn is_policy_blocked(text: &str) -> bool {
+    classify_policy_prefix(text) == PrefixCheck::PolicyBlocked
+}
 
 /// Normalizes an arbitrary effort string into one of Antigravity's supported tiers.
 pub fn normalize_effort(effort_raw: &str) -> &'static str {
@@ -982,12 +1031,193 @@ pub fn openai_to_acp(messages: &[Value]) -> Result<(Option<String>, Vec<Value>)>
     Ok((Some(system_prompt), prompt_blocks))
 }
 
-/// Handles an incoming `/v1/chat/completions` request using Antigravity ACP.
-pub async fn handle_chat_completion(
+pub enum CompletionResult {
+    Response(Response<Body>),
+    PolicyBlocked(String),
+}
+
+#[derive(Debug)]
+pub enum StreamProbeOutcome {
+    PassThrough {
+        initial_chunks: Vec<String>,
+        rest: Option<mpsc::UnboundedReceiver<AcpUpdate>>,
+    },
+    PolicyBlocked(String),
+    StreamError(String),
+}
+
+/// Probes leading text chunks before committing HTTP 200 SSE headers so upstream
+/// policy blocks can be intercepted cleanly with zero extra work on normal turns.
+pub async fn probe_acp_stream(mut rx: mpsc::UnboundedReceiver<AcpUpdate>) -> StreamProbeOutcome {
+    let mut probe = String::new();
+    let mut buffered = Vec::new();
+    while let Some(update) = rx.recv().await {
+        match update {
+            AcpUpdate::Chunk(delta) => {
+                if delta.is_empty() {
+                    continue;
+                }
+                probe.push_str(&delta);
+                buffered.push(delta);
+                match classify_policy_prefix(&probe) {
+                    PrefixCheck::PolicyBlocked => return StreamProbeOutcome::PolicyBlocked(probe),
+                    PrefixCheck::PassThrough => {
+                        return StreamProbeOutcome::PassThrough {
+                            initial_chunks: buffered,
+                            rest: Some(rx),
+                        };
+                    }
+                    PrefixCheck::NeedMore => {}
+                }
+            }
+            AcpUpdate::Completed => {
+                if is_policy_blocked(&probe) {
+                    return StreamProbeOutcome::PolicyBlocked(probe);
+                }
+                return StreamProbeOutcome::PassThrough {
+                    initial_chunks: buffered,
+                    rest: None,
+                };
+            }
+            AcpUpdate::Error(err) => {
+                if is_policy_blocked(&probe) {
+                    return StreamProbeOutcome::PolicyBlocked(probe);
+                }
+                return StreamProbeOutcome::StreamError(err);
+            }
+            _ => {}
+        }
+    }
+
+    if is_policy_blocked(&probe) {
+        StreamProbeOutcome::PolicyBlocked(probe)
+    } else if !buffered.is_empty() {
+        StreamProbeOutcome::PassThrough {
+            initial_chunks: buffered,
+            rest: None,
+        }
+    } else {
+        StreamProbeOutcome::StreamError("Antigravity ACP stream ended without output".to_owned())
+    }
+}
+
+fn sse_chunk_frame(created: u64, model: &str, content: &str) -> Bytes {
+    let chunk = json!({
+        "id": format!("chatcmpl-{}", created),
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "content": content },
+            "finish_reason": null
+        }]
+    });
+    Bytes::from(format!(
+        "data: {}\n\n",
+        serde_json::to_string(&chunk).unwrap_or_default()
+    ))
+}
+
+fn sse_stop_frames(created: u64, model: &str) -> Bytes {
+    let final_chunk = json!({
+        "id": format!("chatcmpl-{}", created),
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    });
+    Bytes::from(format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&final_chunk).unwrap_or_default()
+    ))
+}
+
+fn build_sse_response(
+    initial_chunks: Vec<String>,
+    rest: Option<mpsc::UnboundedReceiver<AcpUpdate>>,
+    model_name: String,
+    created_ts: u64,
+    telemetry_client: Option<Arc<AntigravityClient>>,
+    started: Instant,
+) -> Response<Body> {
+    let initial = std::collections::VecDeque::from(initial_chunks);
+    let stream = futures_util::stream::unfold(
+        (initial, rest, model_name, created_ts, false, telemetry_client, started),
+        move |(mut initial, rest, model, created, finished, telemetry_client, started)| async move {
+            if finished {
+                return None;
+            }
+            if let Some(delta_text) = initial.pop_front() {
+                return Some((
+                    Ok::<_, BoxError>(Frame::data(sse_chunk_frame(created, &model, &delta_text))),
+                    (initial, rest, model, created, false, telemetry_client, started),
+                ));
+            }
+            let Some(mut rx) = rest else {
+                if let Some(ref c) = telemetry_client {
+                    c.record_outcome(&model, started.elapsed(), None);
+                }
+                return Some((
+                    Ok::<_, BoxError>(Frame::data(sse_stop_frames(created, &model))),
+                    (initial, None, model, created, true, telemetry_client, started),
+                ));
+            };
+            while let Some(update) = rx.recv().await {
+                match update {
+                    AcpUpdate::Chunk(delta_text) => {
+                        return Some((
+                            Ok::<_, BoxError>(Frame::data(sse_chunk_frame(created, &model, &delta_text))),
+                            (initial, Some(rx), model, created, false, telemetry_client, started),
+                        ));
+                    }
+                    AcpUpdate::Completed => {
+                        if let Some(ref c) = telemetry_client {
+                            c.record_outcome(&model, started.elapsed(), None);
+                        }
+                        return Some((
+                            Ok::<_, BoxError>(Frame::data(sse_stop_frames(created, &model))),
+                            (initial, None, model, created, true, telemetry_client, started),
+                        ));
+                    }
+                    AcpUpdate::Error(err) => {
+                        if let Some(ref c) = telemetry_client {
+                            c.record_outcome(&model, started.elapsed(), Some(&err));
+                        }
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(ref c) = telemetry_client {
+                c.record_outcome(&model, started.elapsed(), Some("Antigravity ACP stream closed unexpectedly"));
+            }
+            None
+        },
+    );
+
+    let body = StreamBody::new(stream).boxed_unsync();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(body)
+        .unwrap()
+}
+
+/// Handles an incoming `/v1/chat/completions` request via Antigravity ACP, returning
+/// [`CompletionResult::PolicyBlocked`] before emitting HTTP 200 when upstream policy
+/// blocks the prompt so callers can fall back cleanly.
+pub async fn try_chat_completion(
     payload: &Value,
     settings: &Value,
     root: PathBuf,
-) -> Result<Response<Body>> {
+) -> Result<CompletionResult> {
     let started = Instant::now();
     let stream = payload["stream"].as_bool().unwrap_or(false);
     let messages = payload["messages"]
@@ -1011,13 +1241,13 @@ pub async fn handle_chat_completion(
         Ok(sid) => sid,
         Err(e) => {
             client.record_error_only(Some(target_model), &e.to_string());
-            return Ok(json_response(
+            return Ok(CompletionResult::Response(json_response(
                 &json!({
                     "error": format!("Antigravity session initialization failed: {}", e),
                     "code": "antigravity_unavailable"
                 }),
                 StatusCode::BAD_GATEWAY,
-            ));
+            )));
         }
     };
 
@@ -1025,89 +1255,57 @@ pub async fn handle_chat_completion(
     let model_name = target_model.to_owned();
 
     if stream {
-        // SSE Streaming
         let rx = match client.clone().prompt_stream(&session_id, prompt_blocks).await {
             Ok(rx) => rx,
             Err(e) => {
                 client.record_error_only(Some(target_model), &e.to_string());
-                return Ok(json_response(
+                return Ok(CompletionResult::Response(json_response(
                     &json!({
                         "error": format!("Antigravity prompt stream failed: {}", e),
                         "code": "antigravity_prompt_failed"
                     }),
                     StatusCode::BAD_GATEWAY,
-                ));
+                )));
             }
         };
 
-        let telemetry_client = client.clone();
-        let stream = futures_util::stream::unfold(
-            (rx, model_name, created_ts, false, telemetry_client, started),
-            move |(mut rx, model, created, finished, telemetry_client, started)| async move {
-                if finished {
-                    return None;
-                }
-                while let Some(update) = rx.recv().await {
-                    match update {
-                        AcpUpdate::Chunk(delta_text) => {
-                            let chunk = json!({
-                                "id": format!("chatcmpl-{}", created),
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": { "content": delta_text },
-                                    "finish_reason": null
-                                }]
-                            });
-                            let line = format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default());
-                            return Some((
-                                Ok::<_, BoxError>(Frame::data(Bytes::from(line))),
-                                (rx, model, created, false, telemetry_client, started),
-                            ));
-                        }
-                        AcpUpdate::Completed => {
-                            telemetry_client.record_outcome(&model, started.elapsed(), None);
-                            let final_chunk = json!({
-                                "id": format!("chatcmpl-{}", created),
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop"
-                                }]
-                            });
-                            let finish_data = format!(
-                                "data: {}\n\ndata: [DONE]\n\n",
-                                serde_json::to_string(&final_chunk).unwrap_or_default()
-                            );
-                            return Some((
-                                Ok::<_, BoxError>(Frame::data(Bytes::from(finish_data))),
-                                (rx, model, created, true, telemetry_client, started),
-                            ));
-                        }
-                        AcpUpdate::Error(err) => {
-                            telemetry_client.record_outcome(&model, started.elapsed(), Some(&err));
-                            return None;
-                        }
-                        _ => {}
-                    }
-                }
-                None
-            },
-        );
-
-        let body = StreamBody::new(stream).boxed_unsync();
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "keep-alive")
-            .body(body)
-            .unwrap())
+        match probe_acp_stream(rx).await {
+            StreamProbeOutcome::PassThrough { initial_chunks, rest } => {
+                Ok(CompletionResult::Response(build_sse_response(
+                    initial_chunks,
+                    rest,
+                    model_name,
+                    created_ts,
+                    Some(client),
+                    started,
+                )))
+            }
+            StreamProbeOutcome::PolicyBlocked(reason) => {
+                let cancel_client = client.clone();
+                let cancel_sid = session_id.clone();
+                tokio::spawn(async move {
+                    let _ = cancel_client
+                        .notify("session/cancel", json!({ "sessionId": cancel_sid }))
+                        .await;
+                });
+                client.record_outcome(
+                    &model_name,
+                    started.elapsed(),
+                    Some("Prompt blocked by upstream policy; falling back"),
+                );
+                Ok(CompletionResult::PolicyBlocked(reason))
+            }
+            StreamProbeOutcome::StreamError(err) => {
+                client.record_outcome(&model_name, started.elapsed(), Some(&err));
+                Ok(CompletionResult::Response(json_response(
+                    &json!({
+                        "error": format!("Antigravity prompt stream failed: {}", err),
+                        "code": "antigravity_prompt_failed"
+                    }),
+                    StatusCode::BAD_GATEWAY,
+                )))
+            }
+        }
     } else {
         // Non-streaming
         let timeout_secs = settings["completion_timeout_seconds"]
@@ -1120,6 +1318,14 @@ pub async fn handle_chat_completion(
 
         match res {
             Ok((full_text, full_thought, usage)) => {
+                if is_policy_blocked(&full_text) {
+                    client.record_outcome(
+                        &model_name,
+                        started.elapsed(),
+                        Some("Prompt blocked by upstream policy; falling back"),
+                    );
+                    return Ok(CompletionResult::PolicyBlocked(full_text));
+                }
                 client.record_outcome(&model_name, started.elapsed(), None);
                 let mut message = json!({
                     "role": "assistant",
@@ -1140,20 +1346,42 @@ pub async fn handle_chat_completion(
                     }],
                     "usage": usage
                 });
-                Ok(json_response(&completion, StatusCode::OK))
+                Ok(CompletionResult::Response(json_response(
+                    &completion,
+                    StatusCode::OK,
+                )))
             }
             Err(e) => {
                 let msg = e.to_string();
                 client.record_outcome(&model_name, started.elapsed(), Some(&msg));
-                Ok(json_response(
+                Ok(CompletionResult::Response(json_response(
                     &json!({
                         "error": format!("Antigravity completion failed: {}", msg),
                         "code": "antigravity_completion_failed"
                     }),
                     StatusCode::BAD_GATEWAY,
-                ))
+                )))
             }
         }
+    }
+}
+
+/// Handles an incoming `/v1/chat/completions` request using Antigravity ACP.
+#[allow(dead_code)]
+pub async fn handle_chat_completion(
+    payload: &Value,
+    settings: &Value,
+    root: PathBuf,
+) -> Result<Response<Body>> {
+    match try_chat_completion(payload, settings, root).await? {
+        CompletionResult::Response(resp) => Ok(resp),
+        CompletionResult::PolicyBlocked(_) => Ok(json_response(
+            &json!({
+                "error": "Prompt rejected by upstream policy",
+                "code": "antigravity_policy_blocked"
+            }),
+            StatusCode::BAD_GATEWAY,
+        )),
     }
 }
 
@@ -1255,5 +1483,143 @@ mod tests {
         let (sandbox, agy) = configured_paths(&s, &root);
         assert_eq!(sandbox, root.join("agy-sandbox"));
         assert!(agy.is_none());
+    }
+
+    #[test]
+    fn test_policy_prefix_detects_blocks_and_split_prefixes() {
+        assert_eq!(classify_policy_prefix(""), PrefixCheck::NeedMore);
+        assert_eq!(classify_policy_prefix("   \n"), PrefixCheck::NeedMore);
+        assert_eq!(classify_policy_prefix("The "), PrefixCheck::NeedMore);
+        assert_eq!(
+            classify_policy_prefix("The prompt could"),
+            PrefixCheck::NeedMore
+        );
+        assert_eq!(
+            classify_policy_prefix("⚠ Your previous response"),
+            PrefixCheck::NeedMore
+        );
+
+        let google_block = "The prompt could not be submitted. The prompt contains sensitive words that violate Google's [Generative AI Prohibited Use policy](https://policies.google.com/terms/generative-ai/use-policy).";
+        assert_eq!(
+            classify_policy_prefix(google_block),
+            PrefixCheck::PolicyBlocked
+        );
+        assert!(is_policy_blocked(google_block));
+
+        let safety_warning = "⚠ Your previous response was blocked by content safety filters.";
+        assert_eq!(
+            classify_policy_prefix(safety_warning),
+            PrefixCheck::PolicyBlocked
+        );
+        assert!(is_policy_blocked(safety_warning));
+
+        assert_eq!(
+            classify_policy_prefix("The road ahead winds toward Riften."),
+            PrefixCheck::PassThrough
+        );
+        assert_eq!(
+            classify_policy_prefix("Ah, traveler! Care for a tale?"),
+            PrefixCheck::PassThrough
+        );
+        assert!(!is_policy_blocked("The road ahead winds toward Riften."));
+    }
+
+    #[tokio::test]
+    async fn test_probe_acp_stream_passes_through_chunk_one_and_streams_rest() {
+        use http_body_util::BodyExt;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(AcpUpdate::Chunk("Ah, ".to_owned())).unwrap();
+
+        let outcome = probe_acp_stream(rx).await;
+        let (initial_chunks, rest) = match outcome {
+            StreamProbeOutcome::PassThrough {
+                initial_chunks,
+                rest,
+            } => (initial_chunks, rest),
+            other => panic!("expected PassThrough, got {other:?}"),
+        };
+        assert_eq!(initial_chunks, vec!["Ah, "]);
+        assert!(rest.is_some());
+
+        tx.send(AcpUpdate::Chunk("friend!".to_owned())).unwrap();
+        tx.send(AcpUpdate::Completed).unwrap();
+        drop(tx);
+
+        let resp = build_sse_response(
+            initial_chunks,
+            rest,
+            "gemini-3.8-flash-low".to_owned(),
+            123_456,
+            None,
+            Instant::now(),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.ends_with("data: [DONE]\n\n"));
+
+        let mut parser = crate::lyrics::SseParser::default();
+        let events = parser.feed(body.as_bytes()).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["choices"][0]["delta"]["content"], "Ah, ");
+        assert_eq!(events[1]["choices"][0]["delta"]["content"], "friend!");
+        assert_eq!(events[2]["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn test_probe_acp_stream_passes_through_short_completed_prefix() {
+        use http_body_util::BodyExt;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(AcpUpdate::Chunk("The".to_owned())).unwrap();
+        tx.send(AcpUpdate::Completed).unwrap();
+        drop(tx);
+
+        let (initial_chunks, rest) = match probe_acp_stream(rx).await {
+            StreamProbeOutcome::PassThrough {
+                initial_chunks,
+                rest,
+            } => (initial_chunks, rest),
+            other => panic!("expected PassThrough, got {other:?}"),
+        };
+        assert_eq!(initial_chunks, vec!["The"]);
+        assert!(rest.is_none());
+
+        let resp = build_sse_response(
+            initial_chunks,
+            rest,
+            "gemini-3.8-flash-low".to_owned(),
+            123_457,
+            None,
+            Instant::now(),
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let mut parser = crate::lyrics::SseParser::default();
+        let events = parser.feed(&bytes).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["choices"][0]["delta"]["content"], "The");
+        assert_eq!(events[1]["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn test_probe_acp_stream_intercepts_split_google_policy_block() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(AcpUpdate::Chunk("The ".to_owned())).unwrap();
+        tx.send(AcpUpdate::Chunk("prompt could not be ".to_owned()))
+            .unwrap();
+        tx.send(AcpUpdate::Chunk(
+            "submitted. The prompt contains sensitive words that violate Google's [Generative AI Prohibited Use policy](https://policies.google.com/terms/generative-ai/use-policy).".to_owned(),
+        ))
+        .unwrap();
+        tx.send(AcpUpdate::Completed).unwrap();
+        drop(tx);
+
+        match probe_acp_stream(rx).await {
+            StreamProbeOutcome::PolicyBlocked(reason) => {
+                assert!(reason.contains("Generative AI Prohibited Use policy"));
+            }
+            other => panic!("expected PolicyBlocked, got {other:?}"),
+        }
     }
 }
