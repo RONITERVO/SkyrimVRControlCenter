@@ -27,6 +27,14 @@ For users who never use KAT's in-VR overlays and only need KAT Gateway running f
 
 Closing the panel releases its trigger effects. The music relay remains running in the background because the live shared default route also carries NPC dialogue. Closing during Skyrim displays this distinction. The app never kills a legacy relay; an occupied music port is attached read-only for status until a safe transition is performed. An occupied feedback port leaves this app's feedback disarmed and visibly reports the conflict.
 
+## Antigravity local LLM & SkyrimNet routing
+
+The **Antigravity** tab in Control Center manages local `agy acp` inference (`127.0.0.1:8097`) alongside OpenRouter fallback:
+
+- **Backend & model controls**: Separately configure `llm_backend` (SkyrimNet NPC dialogue, combat, evaluation, and vision) and `lyrics_provider` (Bard song drafting) between `antigravity` and `openrouter`, select an Antigravity model ID and effort tier (`low`, `medium`, `high`), optionally override `agy.exe` / sandbox paths, query `agy models` to refresh available models, or restart an idle ACP child worker without interrupting port `8097`.
+- **Reversible SkyrimNet `OpenRouter.yaml` route switcher**: Shows exact `local_bard_composer`, `openrouter`, and `openrouter_decisions` slot counts and requires both `SkyrimVR.exe` and `ModOrganizer.exe` to be closed before switching or restoring. Switching creates a timestamped pre-Antigravity backup (`backups/<timestamp>-before-antigravity/`) only when `provider_id: openrouter` slots exist (preserving existing clean backups on repeated checks) and leaves `openrouter_decisions` untouched; restoring selects the newest valid pre-Antigravity backup containing `provider_id: openrouter` slots.
+- **Headless ACP safeguards**: `agy acp` runs with `CREATE_NO_WINDOW` inside its sandbox folder and auto-denies all tool/filesystem/terminal requests from the agent.
+
 ## Song preferences and native music
 
 Preferences are read from `runtime/bard/settings.json` on every save and patched only in the selected fields. Provider credentials, authorization records, history paths, draft files, and unknown settings remain in their existing locations. No credential is copied into Control Center configuration.
@@ -90,9 +98,9 @@ Run commands from the application directory, or supply `--root <directory>`:
 
 The GUI-subsystem executable supports redirected standard output. The agent API listens only on `127.0.0.1:19464`. `GET /status` returns sanitized status. `POST /command` requires the random local bearer token in `.local/agent-token`; the CLI reads it without printing it. A JSON body contains `action` and optional `body`. No unauthenticated mutation endpoint or shell execution API exists.
 
-Actions include `music-downloads-sync`, `music-downloads-open`, `music-downloads-auto`, `music-downloads-task`, `music-downloads-recover`, and `music-downloads-credits`, plus the music, feedback, startup, driver, KAT, NR, and shader-cache (`shader-cache-clear`, `shader-cache-restore`, `shader-cache-enforce-settings`, `shader-cache-open-backups`, `shader-precompile-start`, `shader-precompile-cancel`) actions. Agent actions use the same validation and authorization as the visible controls.
+Actions include `music-downloads-sync`, `music-downloads-open`, `music-downloads-auto`, `music-downloads-task`, `music-downloads-recover`, and `music-downloads-credits`, `antigravity-refresh-models`, `antigravity-restart`, `antigravity-open-sandbox`, `skyrimnet-switch-antigravity`, `skyrimnet-restore-openrouter`, `skyrimnet-open-config`, and `skyrimnet-open-backups`, plus the music, feedback, startup, driver, KAT, NR, and shader-cache (`shader-cache-clear`, `shader-cache-restore`, `shader-cache-enforce-settings`, `shader-cache-open-backups`, `shader-precompile-start`, `shader-precompile-cancel`) actions. Agent actions use the same validation and authorization as the visible controls.
 
-`--preview` opens all seven panels read-only with services, live feedback, dependency launches, and mutations disabled. `--smoke-test` builds that native window hidden and closes it.
+`--preview` opens all eight panels read-only with services, live feedback, dependency launches, and mutations disabled. `--smoke-test` builds that native window hidden and closes it.
 
 ## Build and verification
 

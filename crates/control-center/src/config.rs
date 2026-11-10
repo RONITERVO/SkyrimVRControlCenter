@@ -22,14 +22,10 @@ pub fn now() -> f64 {
         .unwrap_or_default()
         .as_secs_f64()
 }
-pub fn write_json(path: &Path, value: &Value) -> Result<()> {
+pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(path.parent().ok_or("Missing parent")?).map_err(|e| e.to_string())?;
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(
-        &temp,
-        serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    fs::write(&temp, bytes).map_err(|e| e.to_string())?;
     let from = wide(&temp.to_string_lossy());
     let to = wide(&path.to_string_lossy());
     let ok = unsafe {
@@ -41,9 +37,14 @@ pub fn write_json(path: &Path, value: &Value) -> Result<()> {
         )
     };
     if ok == 0 {
+        let _ = fs::remove_file(&temp);
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
+}
+pub fn write_json(path: &Path, value: &Value) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+    write_bytes_atomic(path, &bytes)
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +88,8 @@ pub struct Config {
     pub nr_guard: Option<NrGuardConfig>,
     #[serde(default)]
     pub shader_cache: Option<ShaderCacheConfig>,
+    #[serde(default)]
+    pub skyrimnet_config_dir: Option<PathBuf>,
 }
 fn default_music_root() -> PathBuf {
     PathBuf::from("runtime/bard")
@@ -147,7 +150,43 @@ impl Config {
                 *fp = resolve_path(root, fp);
             }
         }
+        if let Some(sn) = cfg.skyrimnet_config_dir.as_mut() {
+            *sn = resolve_path(root, sn);
+        }
         Ok(cfg)
+    }
+    /// Resolves the SkyrimNet `config` directory (containing `OpenRouter.yaml`).
+    pub fn effective_skyrimnet_config_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = &self.skyrimnet_config_dir {
+            return Some(dir.clone());
+        }
+        if let Ok(settings) = self.music_settings() {
+            if let Some(cred) = settings["openrouter_credentials_file"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let p = resolve_path(&self.music_root, Path::new(cred));
+                if let Some(parent) = p.parent() {
+                    return Some(parent.to_path_buf());
+                }
+            }
+            if let Some(data) = settings["skyrimnet_data"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let p = resolve_path(&self.music_root, Path::new(data));
+                if let Some(parent) = p.parent() {
+                    return Some(parent.join("config"));
+                }
+            }
+        }
+        if let Some(nr) = &self.nr_guard {
+            return Some(nr.mo2_overwrite_dir.join(r"SKSE\Plugins\SkyrimNet\config"));
+        }
+        self.effective_shader_cache()
+            .map(|sc| sc.mo2_root.join(r"overwrite\SKSE\Plugins\SkyrimNet\config"))
     }
     pub fn effective_shader_cache(&self) -> Option<ShaderCacheConfig> {
         if let Some(mut sc) = self.shader_cache.clone() {
@@ -214,6 +253,7 @@ pub const MUSIC_KEYS: &[&str] = &[
     "native_real_interval_override",
     "keep_both_suno_variants",
     "llm_backend",
+    "lyrics_provider",
     "antigravity",
 ];
 pub fn public_music(v: &Value) -> Value {
@@ -235,6 +275,21 @@ pub fn public_music(v: &Value) -> Value {
     );
     result
 }
+fn normalize_optional_path(value: &mut Value, name: &str) -> Result<()> {
+    match value {
+        Value::Null => Ok(()),
+        Value::String(s) => {
+            let trimmed = s.trim().to_owned();
+            if trimmed.is_empty() {
+                *value = Value::Null;
+            } else {
+                *value = Value::String(trimmed);
+            }
+            Ok(())
+        }
+        _ => Err(format!("antigravity.{name} must be a string or null")),
+    }
+}
 pub fn patch_music(current: &Value, patch: &Value) -> Result<Value> {
     let fields = patch
         .as_object()
@@ -244,7 +299,15 @@ pub fn patch_music(current: &Value, patch: &Value) -> Result<Value> {
         if !MUSIC_KEYS.contains(&k.as_str()) && k != "model_profiles" {
             return Err(format!("Cannot edit {k} through song preferences"));
         }
-        v[k] = value.clone();
+        if k == "antigravity"
+            && let (Some(existing), Some(incoming)) = (v["antigravity"].as_object_mut(), value.as_object())
+        {
+            for (ak, av) in incoming {
+                existing.insert(ak.clone(), av.clone());
+            }
+        } else {
+            v[k] = value.clone();
+        }
     }
     let model = v["selected_model"]
         .as_str()
@@ -276,8 +339,53 @@ pub fn patch_music(current: &Value, patch: &Value) -> Result<Value> {
             return Err("Selected song model is disabled; enable it first".into());
         }
     }
-    if v["llm_backend"].as_str().is_some_and(|b| b != "antigravity" && b != "openrouter") {
-        return Err("llm_backend must be antigravity or openrouter".into());
+    for key in ["llm_backend", "lyrics_provider"] {
+        if !v[key].is_null() {
+            let val = v[key]
+                .as_str()
+                .ok_or_else(|| format!("{key} must be antigravity or openrouter"))?;
+            if val != "antigravity" && val != "openrouter" {
+                return Err(format!("{key} must be antigravity or openrouter"));
+            }
+        }
+    }
+    if !v["antigravity"].is_null() {
+        let ag = v["antigravity"]
+            .as_object_mut()
+            .ok_or("antigravity settings must be an object")?;
+        if let Some(m_val) = ag.get_mut("model")
+            && !m_val.is_null()
+        {
+            let m = m_val
+                .as_str()
+                .map(str::trim)
+                .ok_or("Antigravity model must be a string")?
+                .to_owned();
+            if !crate::antigravity_cli::is_valid_model_id(&m) {
+                return Err("Enter a valid Antigravity model ID (no slashes or spaces)".into());
+            }
+            *m_val = Value::String(m);
+        }
+        if let Some(e_val) = ag.get_mut("effort")
+            && !e_val.is_null()
+        {
+            let e = e_val
+                .as_str()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .ok_or("Antigravity effort must be low, medium, or high")?;
+            let normalized = match e.as_str() {
+                "low" | "medium" | "high" => e,
+                "med" => "medium".to_owned(),
+                _ => return Err("Antigravity effort must be low, medium, or high".into()),
+            };
+            *e_val = Value::String(normalized);
+        }
+        if let Some(agy_path) = ag.get_mut("agy_path") {
+            normalize_optional_path(agy_path, "agy_path")?;
+        }
+        if let Some(sandbox_dir) = ag.get_mut("sandbox_dir") {
+            normalize_optional_path(sandbox_dir, "sandbox_dir")?;
+        }
     }
     if !["off", "minimal", "low", "medium", "high", "xhigh", "max"]
         .contains(&v["reasoning_effort"].as_str().unwrap_or(""))
@@ -343,9 +451,39 @@ mod tests {
             json!({"suno_duration_seconds":180}),
             json!({"include_history":"true"}),
             json!({"native_spending_mode":"native_automatic"}),
+            json!({"llm_backend":"other"}),
+            json!({"lyrics_provider":"other"}),
+            json!({"antigravity":{"model":"invalid/slash"}}),
+            json!({"antigravity":{"effort":"turbo"}}),
         ] {
             assert!(patch_music(&settings(), &p).is_err());
         }
+    }
+    #[test]
+    fn antigravity_patch_merges_and_normalizes_blank_paths() {
+        let mut base = settings();
+        base["antigravity"] = json!({"model":"gemini-3.8-flash-low","effort":"low","extra":"keep"});
+        let updated = patch_music(
+            &base,
+            &json!({
+                "llm_backend": "antigravity",
+                "lyrics_provider": "antigravity",
+                "antigravity": {
+                    "model": "gemini-4-argon-high",
+                    "effort": "high",
+                    "agy_path": "  ",
+                    "sandbox_dir": ""
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(updated["llm_backend"], "antigravity");
+        assert_eq!(updated["lyrics_provider"], "antigravity");
+        assert_eq!(updated["antigravity"]["model"], "gemini-4-argon-high");
+        assert_eq!(updated["antigravity"]["effort"], "high");
+        assert_eq!(updated["antigravity"]["extra"], "keep");
+        assert!(updated["antigravity"]["agy_path"].is_null());
+        assert!(updated["antigravity"]["sandbox_dir"].is_null());
     }
     #[test]
     fn custom_model_has_no_inherited_price_cap() {

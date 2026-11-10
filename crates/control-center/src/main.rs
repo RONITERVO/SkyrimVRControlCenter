@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod antigravity_cli;
 mod config;
 mod feedback;
 mod feedback_worker;
@@ -10,6 +11,7 @@ mod runtime;
 mod service;
 mod shader_cache;
 mod shader_precompile;
+mod skyrimnet_route;
 mod ui;
 use config::Result;
 use serde_json::json;
@@ -93,7 +95,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
     if args.iter().any(|a| a == "--inspect") {
-        println!("{}",serde_json::to_string_pretty(&json!({"music":config::public_music(&config.music_settings()?),"feedback":config.feedback_settings()?,"dependencies":config.dependencies,"nativeMusicEnginePresent":root.join("skyrim-bard-engine.exe").is_file(),"katOverlayStubs":kat::stub_status(&root),"shaderCache":shader_cache::status(config.effective_shader_cache().as_ref()),"credentialsCopied":false})).unwrap());
+        println!("{}",serde_json::to_string_pretty(&json!({"music":config::public_music(&config.music_settings()?),"feedback":config.feedback_settings()?,"dependencies":config.dependencies,"nativeMusicEnginePresent":root.join("skyrim-bard-engine.exe").is_file(),"katOverlayStubs":kat::stub_status(&root),"shaderCache":shader_cache::status(config.effective_shader_cache().as_ref()),"skyrimnetRoute":skyrimnet_route::status(&config,&root),"credentialsCopied":false})).unwrap());
         return Ok(());
     }
     if args.iter().any(|a| a == "--status") {

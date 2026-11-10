@@ -30,19 +30,18 @@ After editing any Rust code under `crates\`, rebuild, test, lint, and stage both
 
 ## Antigravity LLM Integration (Zero-Credit NPC & Bard Inference)
 
-To route all SkyrimNet NPC dialogue, combat, actions, vision, and Bard lyrics to local Antigravity (`gemini-3.8-flash-low`) instead of OpenRouter:
+Use the **Antigravity** tab in Control Center (or the CLI scripts below while Skyrim VR and Mod Organizer 2 are closed) to configure and route SkyrimNet NPC dialogue, combat, actions, vision, and Bard lyrics to local Antigravity (`agy acp`, default `gemini-3.8-flash-low`):
 
-```powershell
-.\scripts\Switch-SkyrimNet-To-Antigravity.ps1
-```
+- **In the Control Center UI (`Antigravity` tab)**:
+  - View live `agy.exe` discovery, persistent ACP worker state, latency/failure stats, and current `OpenRouter.yaml` route counts.
+  - Switch **SkyrimNet / NPC relay backend** (`llm_backend`) and **Bard lyrics provider** (`lyrics_provider`) between `antigravity` and `openrouter`.
+  - Pick an Antigravity model + effort tier (`low` / `medium` / `high`), refresh models from `agy models`, or restart an idle ACP worker without stopping port `8097`.
+  - Safely **Switch SkyrimNet -> Antigravity** or **Restore SkyrimNet -> OpenRouter** while Skyrim VR and MO2 are closed.
+- **Via PowerShell**:
+  - Route to Antigravity: `.\scripts\Switch-SkyrimNet-To-Antigravity.ps1`
+  - Revert `OpenRouter.yaml` from backup: `.\scripts\Restore-SkyrimNet-OpenRouter.ps1`
 
-*(Ensure Skyrim VR and Mod Organizer 2 are closed beforehand.)*
-
-- The `decisions` slot remains on OpenRouter (`openrouter_decisions`) with `typesafe/jev-1.13`.
-- All other SkyrimNet slots route through the local relay on `127.0.0.1:8097` using `agy acp`.
-- To switch back to OpenRouter at any time:
-  - In `runtime\bard\settings.json`: set `"llm_backend": "openrouter"`.
-  - Or run: `.\scripts\Restore-SkyrimNet-OpenRouter.ps1`.
+The `decisions` slot remains on OpenRouter (`openrouter_decisions`) with `typesafe/jev-1.13`, and all other routed SkyrimNet slots pass through the local relay on `127.0.0.1:8097`.
 
 ## Both song variants
 

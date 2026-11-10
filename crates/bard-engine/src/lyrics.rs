@@ -239,18 +239,44 @@ pub async fn make_draft(
     let lyrics_s = s.clone();
     let result = async {
         if provider_name == "antigravity" {
-            let sandbox_dir = lyrics_s["antigravity"]["sandbox_dir"]
-                .as_str()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| lyrics_root.join("agy-sandbox"));
-            let agy_path = lyrics_s["antigravity"]["agy_path"].as_str().map(str::to_owned);
+            let (sandbox_dir, agy_path) =
+                crate::antigravity::configured_paths(&lyrics_s, &lyrics_root);
             let client = crate::antigravity::get_client(sandbox_dir, agy_path);
-            let resolved_model = crate::antigravity::resolve_model(request["model"].as_str(), lyrics_s["antigravity"]["effort"].as_str(), &lyrics_s);
+            let resolved_model = crate::antigravity::resolve_model(
+                None,
+                lyrics_s["antigravity"]["effort"].as_str(),
+                &lyrics_s,
+            );
             let messages = request["messages"].as_array().context("Invalid messages array")?;
             let (system_prompt, prompt_blocks) = crate::antigravity::openai_to_acp(messages)?;
-            let session_id = client.new_session(&resolved_model, system_prompt.as_deref()).await?;
+            let session_id = match client
+                .new_session(&resolved_model, system_prompt.as_deref())
+                .await
+            {
+                Ok(sid) => sid,
+                Err(e) => {
+                    client.record_outcome(&resolved_model, started.elapsed(), Some(&e.to_string()));
+                    return Err(e);
+                }
+            };
             let timeout_secs = num(&lyrics_s, "completion_timeout_seconds", 300.0);
-            let (full_text, _, usage) = client.prompt_buffered(&session_id, prompt_blocks, Duration::from_secs_f64(timeout_secs)).await?;
+            let (full_text, _, usage) = match client
+                .prompt_buffered(&session_id, prompt_blocks, Duration::from_secs_f64(timeout_secs))
+                .await
+            {
+                Ok(ok) => {
+                    crate::antigravity::record_outcome(&resolved_model, started.elapsed(), None);
+                    ok
+                }
+                Err(e) => {
+                    crate::antigravity::record_outcome(
+                        &resolved_model,
+                        started.elapsed(),
+                        Some(&e.to_string()),
+                    );
+                    return Err(e);
+                }
+            };
 
             let clean_json = if let Some(start) = full_text.find('{') {
                 if let Some(end) = full_text.rfind('}') {
