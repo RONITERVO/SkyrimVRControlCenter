@@ -20,10 +20,10 @@ param(
 $ErrorActionPreference = "Stop"
 
 # 1. Check for running processes
-$blockers = @("SkyrimVR", "ModOrganizer", "skyrim-bard-engine")
+$blockers = @("SkyrimVR", "ModOrganizer", "ModOrganizer_original")
 $running = Get-Process -ErrorAction SilentlyContinue | Where-Object { $blockers -contains $_.ProcessName }
 if ($running -and -not $Force) {
-    Write-Error "Cannot modify SkyrimNet configuration while the game or tools are running:`n$($running | Select-Object -ExpandProperty ProcessName | Out-String)`nPlease close Skyrim and Mod Organizer 2 before running this script."
+    Write-Error "Cannot modify SkyrimNet configuration while the game or MO2 is running:`n$($running | Select-Object -ExpandProperty ProcessName | Out-String)`nPlease close Skyrim and Mod Organizer 2 before running this script."
 }
 
 if (-not (Test-Path $SkyrimNetConfigDir)) {
@@ -37,7 +37,15 @@ if (-not (Test-Path $openRouterYaml)) {
     Write-Error "OpenRouter.yaml not found at: $openRouterYaml"
 }
 
-# 2. Create timestamped backup
+# 2. Inspect before backing up so repeated runs never overwrite clean pre-Antigravity backups
+$lines = Get-Content -LiteralPath $openRouterYaml
+$openRouterMatches = @($lines | Where-Object { $_ -match '^\s*-\s*provider_id:\s*openrouter\s*$' }).Count
+if ($openRouterMatches -eq 0) {
+    Write-Host "OpenRouter.yaml is already routed to Antigravity (0 openrouter slots left); preserving existing backups." -ForegroundColor Yellow
+    return
+}
+
+# 3. Create timestamped backup
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $backupDir = Join-Path $repoRoot "backups\$timestamp-before-antigravity"
@@ -49,9 +57,8 @@ if (Test-Path $providersYaml) {
 }
 Write-Host "Backed up original configuration to: $backupDir" -ForegroundColor Green
 
-# 3. Modify OpenRouter.yaml: replace 'provider_id: openrouter' with 'provider_id: local_bard_composer'
+# 4. Modify OpenRouter.yaml: replace 'provider_id: openrouter' with 'provider_id: local_bard_composer'
 # Note: Regex specifically targets exact "provider_id:\s*openrouter\s*$" so that "openrouter_decisions" is preserved!
-$lines = Get-Content -LiteralPath $openRouterYaml
 $modifiedCount = 0
 $newLines = @()
 
@@ -65,8 +72,8 @@ foreach ($line in $lines) {
     }
 }
 
-# Write back with original encoding
-Set-Content -LiteralPath $openRouterYaml -Value $newLines -Encoding utf8
+# Write back cleanly as UTF-8 without BOM
+[System.IO.File]::WriteAllLines($openRouterYaml, $newLines, (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host "Successfully switched SkyrimNet LLM traffic to Antigravity!" -ForegroundColor Cyan
 Write-Host "Updated $modifiedCount provider references to 'local_bard_composer' (port 8097)." -ForegroundColor Gray

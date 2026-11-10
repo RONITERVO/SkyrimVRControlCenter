@@ -18,18 +18,22 @@ param(
 $ErrorActionPreference = "Stop"
 
 # 1. Check for running processes
-$blockers = @("SkyrimVR", "ModOrganizer", "skyrim-bard-engine")
+$blockers = @("SkyrimVR", "ModOrganizer", "ModOrganizer_original")
 $running = Get-Process -ErrorAction SilentlyContinue | Where-Object { $blockers -contains $_.ProcessName }
 if ($running -and -not $Force) {
-    Write-Error "Cannot restore SkyrimNet configuration while the game or tools are running:`n$($running | Select-Object -ExpandProperty ProcessName | Out-String)`nPlease close Skyrim and Mod Organizer 2 before running this script."
+    Write-Error "Cannot restore SkyrimNet configuration while the game or MO2 is running:`n$($running | Select-Object -ExpandProperty ProcessName | Out-String)`nPlease close Skyrim and Mod Organizer 2 before running this script."
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
 if (-not $BackupPath) {
-    $latestBackup = Get-ChildItem -Path (Join-Path $repoRoot "backups") -Directory -Filter "*-before-antigravity" | Sort-Object CreationTime -Descending | Select-Object -First 1
+    $candidates = Get-ChildItem -Path (Join-Path $repoRoot "backups") -Directory -Filter "*-before-antigravity" | Sort-Object Name -Descending
+    $latestBackup = $candidates | Where-Object {
+        $yaml = Join-Path $_.FullName "OpenRouter.yaml"
+        (Test-Path $yaml) -and ((Get-Content -LiteralPath $yaml | Where-Object { $_ -match '^\s*-\s*provider_id:\s*openrouter\s*$' }).Count -gt 0)
+    } | Select-Object -First 1
     if (-not $latestBackup) {
-        Write-Error "No *-before-antigravity backups found in: $(Join-Path $repoRoot 'backups')"
+        Write-Error "No valid pre-Antigravity *-before-antigravity backups containing provider_id: openrouter found in: $(Join-Path $repoRoot 'backups')"
     }
     $BackupPath = $latestBackup.FullName
 }

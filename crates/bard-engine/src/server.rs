@@ -170,6 +170,10 @@ async fn handle(
             let value = blocking::run(move || engine.cancel()).await?;
             Ok(json_response(&value, StatusCode::OK))
         }
+        "/controls/antigravity-restart" => {
+            let value = crate::antigravity::restart_global().await?;
+            Ok(json_response(&value, StatusCode::OK))
+        }
         "/v1/chat/completions" | "/chat/completions" => {
             if !is_native_request(&payload) {
                 let root = engine.root.clone();
@@ -225,7 +229,7 @@ pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
         json!({"event":"listening","runtime":"rust","version":env!("CARGO_PKG_VERSION"),"address":listener.local_addr()?.to_string(),"native_suno_transport":"direct_https"})
     );
     loop {
-        tokio::select! {accepted=listener.accept()=>{let(stream,_)=accepted?;let engine=engine.clone();let archive=archive.clone();tokio::spawn(async move{let service=service_fn(move|req|{let engine=engine.clone();let archive=archive.clone();async move{let result=handle(req,engine,archive).await.unwrap_or_else(|_|json_response(&json!({"error":"Music engine stopped this request; inspect local attempt metadata","automatic_retry":false}),StatusCode::BAD_GATEWAY));Ok::<_,Infallible>(result)}});let _=hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream),service).await;});},_ = tokio::signal::ctrl_c()=>{clock.abort();archive_worker.abort();break;}}
+        tokio::select! {accepted=listener.accept()=>{let(stream,_)=accepted?;let engine=engine.clone();let archive=archive.clone();tokio::spawn(async move{let service=service_fn(move|req|{let engine=engine.clone();let archive=archive.clone();async move{let result=handle(req,engine,archive).await.unwrap_or_else(|_|json_response(&json!({"error":"Music engine stopped this request; inspect local attempt metadata","automatic_retry":false}),StatusCode::BAD_GATEWAY));Ok::<_,Infallible>(result)}});let _=hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream),service).await;});},_ = tokio::signal::ctrl_c()=>{clock.abort();archive_worker.abort();crate::antigravity::shutdown_global().await;break;}}
     }
     Ok(())
 }

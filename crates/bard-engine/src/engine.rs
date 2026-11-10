@@ -119,12 +119,17 @@ impl Engine {
             && flag(&s, "native_integration_enabled", true)
             && flag(&s, "native_real_interval_override", false);
         let backend = text(&s, "llm_backend", "antigravity");
+        let lyrics_provider = text(&s, "lyrics_provider", "openrouter");
+        let antigravity_info = crate::antigravity::health_snapshot(&s, &self.root);
+        let openrouter_model = text(&s, "selected_model", "ready");
         let active_model = if backend == "antigravity" {
-            text(&s["antigravity"], "model", crate::antigravity::DEFAULT_ANTIGRAVITY_MODEL)
+            antigravity_info["resolved_model"]
+                .as_str()
+                .unwrap_or(crate::antigravity::DEFAULT_ANTIGRAVITY_MODEL)
         } else {
-            text(&s, "selected_model", "ready")
+            openrouter_model
         };
-        let mut status = json!({"running":true,"runtime":"rust","version":env!("CARGO_PKG_VERSION"),"llm_backend":backend,"selected_model":active_model,"native_custom_preferences":flag(&s,"native_integration_enabled",true),"suno_requests_armed":if flag(&p,"recurring",false){Value::Null}else{p["remaining"].clone()},"ongoing_native_suno_authorized":flag(&p,"recurring",false),"timing":if polling{"real_gameplay_minimum"}else{"native"},"game_polling_enabled":polling,"keep_both_variants":flag(&s,"keep_both_suno_variants",true),"last":state.last,"controls_scope":"new_native_lyrics_only","native_suno_transport":"direct_https","native_suno_proxy_active":false,"can_cancel_submitted_native_music":false,"automatic_secondary_capture":false,"secondary_import":"dashboard_only; no request-gate bypass","settings_path":self.root.join("settings.json")});
+        let mut status = json!({"running":true,"runtime":"rust","version":env!("CARGO_PKG_VERSION"),"llm_backend":backend,"lyrics_provider":lyrics_provider,"selected_model":active_model,"openrouter_model":openrouter_model,"antigravity":antigravity_info,"native_custom_preferences":flag(&s,"native_integration_enabled",true),"suno_requests_armed":if flag(&p,"recurring",false){Value::Null}else{p["remaining"].clone()},"ongoing_native_suno_authorized":flag(&p,"recurring",false),"timing":if polling{"real_gameplay_minimum"}else{"native"},"game_polling_enabled":polling,"keep_both_variants":flag(&s,"keep_both_suno_variants",true),"last":state.last,"controls_scope":"new_native_lyrics_only","native_suno_transport":"direct_https","native_suno_proxy_active":false,"can_cancel_submitted_native_music":false,"automatic_secondary_capture":false,"secondary_import":"dashboard_only; no request-gate bypass","settings_path":self.root.join("settings.json")});
         status["song_configuration_valid"] = json!(song_error.is_none());
         status["song_configuration_error"] = json!(song_error);
         Ok(status)
@@ -358,7 +363,7 @@ pub fn now() -> f64 {
 pub fn offline_status(root: &Path) -> Result<Value> {
     let s = read_settings(root)?;
     Ok(
-        json!({"runtime":"rust","version":env!("CARGO_PKG_VERSION"),"running":false,"selected_model":s["selected_model"],"thinking":s["reasoning_effort"],"include_history":flag(&s,"include_history",true),"native_spending_mode":s["native_spending_mode"],"native_suno_transport":"direct_https","controls_scope":"new_native_lyrics_only","automatic_secondary_capture":false,"native_configuration_modified":false}),
+        json!({"runtime":"rust","version":env!("CARGO_PKG_VERSION"),"running":false,"llm_backend":text(&s,"llm_backend","antigravity"),"lyrics_provider":text(&s,"lyrics_provider","openrouter"),"antigravity":crate::antigravity::health_snapshot(&s,root),"selected_model":s["selected_model"],"thinking":s["reasoning_effort"],"include_history":flag(&s,"include_history",true),"native_spending_mode":s["native_spending_mode"],"native_suno_transport":"direct_https","controls_scope":"new_native_lyrics_only","automatic_secondary_capture":false,"native_configuration_modified":false}),
     )
 }
 
@@ -468,5 +473,31 @@ mod tests {
             s["native_recurring_suno_authorization"],
             "recorded original approval"
         );
+    }
+
+    #[test]
+    fn status_reports_resolved_antigravity_model_and_effort() {
+        let d = tempfile::tempdir().unwrap();
+        save_json(
+            &d.path().join("settings.json"),
+            &json!({
+                "llm_backend": "antigravity",
+                "lyrics_provider": "antigravity",
+                "selected_model": "z-ai/glm-5.3-flash",
+                "antigravity": {
+                    "model": "gemini-4-argon-low",
+                    "effort": "high"
+                }
+            }),
+        )
+        .unwrap();
+        let e = Engine::new(d.path().to_owned()).unwrap();
+        let health = e.status().unwrap();
+        assert_eq!(health["llm_backend"], "antigravity");
+        assert_eq!(health["lyrics_provider"], "antigravity");
+        assert_eq!(health["selected_model"], "gemini-4-argon-high");
+        assert_eq!(health["openrouter_model"], "z-ai/glm-5.3-flash");
+        assert_eq!(health["antigravity"]["effort"], "high");
+        assert_eq!(health["antigravity"]["resolved_model"], "gemini-4-argon-high");
     }
 }

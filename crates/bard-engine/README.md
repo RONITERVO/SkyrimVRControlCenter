@@ -86,8 +86,9 @@ Version 0.2.1 introduces a native Antigravity ACP (`agy acp`) backend:
 - **Fast Response**: Uses persistent JSON-RPC over `stdio` to the `agy acp` server. Requests execute in ~2–3 seconds on `gemini-3.8-flash-low`.
 - **Strict Headless Safety**: Automatically auto-denies tool execution and workspace access requests from the agent, guaranteeing zero side effects on the host filesystem.
 - **Full OpenAI API Compatibility**: Emits standard SSE streaming chunk deltas (`chat.completion.chunk`) and complete responses (`chat.completion`), including vision base64 image parsing.
-- **Seamless OpenRouter Fallback**: Set `"llm_backend": "openrouter"` in `settings.json` (or via the Control Center UI) to revert all relay traffic back to OpenRouter.
-- **SkyrimNet Route Automation**: Run `scripts\Switch-SkyrimNet-To-Antigravity.ps1` to route SkyrimNet variants to the relay on port 8097 while keeping the `decisions` slot on OpenRouter (`openrouter_decisions`). Revert at any time with `scripts\Restore-SkyrimNet-OpenRouter.ps1`.
+- **Seamless OpenRouter Fallback**: Set `"llm_backend": "openrouter"` (and/or `"lyrics_provider": "openrouter"`) in `settings.json` or via the Control Center **Antigravity** tab to revert relay/lyric traffic back to OpenRouter.
+- **ACP Observability & Idle Restart**: `GET /health` exposes sanitized `antigravity` telemetry (`resolved_model`, `effort`, `agy_found`, `acp_running`, `acp_initialized`, `active_sessions`, request counters, last latency, and last error). `POST /controls/antigravity-restart` stops an idle `agy acp` child without interrupting port `8097`.
+- **SkyrimNet Route Automation**: Use the Control Center **Antigravity** tab or `scripts\Switch-SkyrimNet-To-Antigravity.ps1` to route SkyrimNet variants to port `8097` while keeping `openrouter_decisions` on OpenRouter. Revert at any time from the UI or `scripts\Restore-SkyrimNet-OpenRouter.ps1`.
 
 ## Deliberate limits
 

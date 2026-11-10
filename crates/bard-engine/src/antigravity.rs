@@ -12,12 +12,12 @@ use hyper::{body::Frame, Response, StatusCode};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex as StdMutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -32,13 +32,32 @@ type Body = UnsyncBoxBody<Bytes, BoxError>;
 pub const DEFAULT_ANTIGRAVITY_MODEL: &str = "gemini-3.8-flash-low";
 pub const DEFAULT_ANTIGRAVITY_EFFORT: &str = "low";
 
+/// Normalizes an arbitrary effort string into one of Antigravity's supported tiers.
+pub fn normalize_effort(effort_raw: &str) -> &'static str {
+    match effort_raw.trim().to_lowercase().as_str() {
+        "low" | "minimal" | "off" | "none" => "low",
+        "medium" | "med" => "medium",
+        "high" | "xhigh" | "max" => "high",
+        _ => "low",
+    }
+}
+
+/// Resolves the effective Antigravity effort tier from payload override or settings.
+pub fn resolve_effort(payload_effort: Option<&str>, settings: &Value) -> &'static str {
+    let effort_raw = payload_effort
+        .or_else(|| settings["antigravity"]["effort"].as_str())
+        .or_else(|| settings["reasoning_effort"].as_str())
+        .unwrap_or(DEFAULT_ANTIGRAVITY_EFFORT);
+    normalize_effort(effort_raw)
+}
+
 /// Resolves the concrete Antigravity model ID based on payload, configured settings, and effort level.
 pub fn resolve_model(
     payload_model: Option<&str>,
     payload_effort: Option<&str>,
     settings: &Value,
 ) -> String {
-    // 1. If payload explicitly specifies an exact Antigravity model ID, use it directly
+    // 1. If payload explicitly specifies an exact Antigravity model ID, use it directly.
     if let Some(m) = payload_model {
         let m_clean = m.trim();
         if m_clean.starts_with("gemini-") || m_clean.starts_with("claude-") || m_clean.starts_with("gpt-oss-") {
@@ -47,22 +66,13 @@ pub fn resolve_model(
     }
 
     // 2. Resolve effort level
-    let effort_raw = payload_effort
-        .or_else(|| settings["antigravity"]["effort"].as_str())
-        .or_else(|| settings["reasoning_effort"].as_str())
-        .unwrap_or(DEFAULT_ANTIGRAVITY_EFFORT);
-
-    let effort_tier = match effort_raw.to_lowercase().as_str() {
-        "low" | "minimal" => "low",
-        "medium" | "med" => "medium",
-        "high" | "xhigh" | "max" => "high",
-        "off" | "none" => "low", // Flash requires minimum low tier
-        _ => "low",
-    };
+    let effort_tier = resolve_effort(payload_effort, settings);
 
     // 3. Resolve base model
     let configured_model = settings["antigravity"]["model"]
         .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_ANTIGRAVITY_MODEL);
 
     let base = configured_model
@@ -70,6 +80,11 @@ pub fn resolve_model(
         .or_else(|| configured_model.strip_suffix("-medium"))
         .or_else(|| configured_model.strip_suffix("-high"))
         .unwrap_or(configured_model);
+
+    // GPT-OSS 120B is published only at the -medium tier.
+    if base == "gpt-oss-120b" {
+        return "gpt-oss-120b-medium".to_owned();
+    }
 
     format!("{}-{}", base, effort_tier)
 }
@@ -159,32 +174,92 @@ struct ChildProcessHandle {
     child: Child,
     stdin_tx: mpsc::Sender<Vec<u8>>,
     initialized: bool,
+    sandbox_dir: PathBuf,
+    configured_agy_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ClientConfig {
+    sandbox_dir: PathBuf,
+    configured_agy_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TelemetryState {
+    acp_running: bool,
+    acp_initialized: bool,
+    active_sessions: u64,
+    total_requests: u64,
+    failed_requests: u64,
+    last_latency_ms: Option<u64>,
+    last_model: Option<String>,
+    last_error: Option<String>,
+    last_completed_at: Option<f64>,
 }
 
 type PendingRequestsMap = HashMap<u64, oneshot::Sender<Result<Value, String>>>;
 type ActiveSessionsMap = HashMap<String, SessionChannels>;
 
 pub struct AntigravityClient {
-    sandbox_dir: PathBuf,
-    configured_agy_path: Option<String>,
+    config: StdMutex<ClientConfig>,
     inner: Mutex<Option<ChildProcessHandle>>,
     next_id: AtomicU64,
     pending_requests: Arc<Mutex<PendingRequestsMap>>,
     active_sessions: Arc<Mutex<ActiveSessionsMap>>,
+    telemetry: Arc<StdMutex<TelemetryState>>,
     is_shutting_down: AtomicBool,
 }
 
 impl AntigravityClient {
     pub fn new(sandbox_dir: PathBuf, configured_agy_path: Option<String>) -> Self {
         Self {
-            sandbox_dir,
-            configured_agy_path,
+            config: StdMutex::new(ClientConfig {
+                sandbox_dir,
+                configured_agy_path,
+            }),
             inner: Mutex::new(None),
             next_id: AtomicU64::new(1),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
+            telemetry: Arc::new(StdMutex::new(TelemetryState::default())),
             is_shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// Updates sandbox/binary configuration for subsequent child launches.
+    pub fn update_config(&self, sandbox_dir: PathBuf, configured_agy_path: Option<String>) {
+        let mut cfg = self.config.lock().unwrap();
+        cfg.sandbox_dir = sandbox_dir;
+        cfg.configured_agy_path = configured_agy_path;
+    }
+
+    fn current_config(&self) -> ClientConfig {
+        self.config.lock().unwrap().clone()
+    }
+
+    pub fn record_outcome(&self, model: &str, elapsed: Duration, error: Option<&str>) {
+        let mut t = self.telemetry.lock().unwrap();
+        t.total_requests += 1;
+        t.last_model = Some(model.to_owned());
+        t.last_latency_ms = Some(elapsed.as_millis().min(u64::MAX as u128) as u64);
+        t.last_completed_at = Some(crate::engine::now());
+        if let Some(err) = error {
+            t.failed_requests += 1;
+            t.last_error = Some(err.to_owned());
+        } else {
+            t.last_error = None;
+        }
+    }
+
+    fn record_error_only(&self, model: Option<&str>, error: &str) {
+        let mut t = self.telemetry.lock().unwrap();
+        t.total_requests += 1;
+        t.failed_requests += 1;
+        if let Some(m) = model {
+            t.last_model = Some(m.to_owned());
+        }
+        t.last_error = Some(error.to_owned());
+        t.last_completed_at = Some(crate::engine::now());
     }
 
     fn next_request_id(&self) -> u64 {
@@ -193,17 +268,33 @@ impl AntigravityClient {
 
     /// Ensures the child `agy acp` process is running and initialized.
     async fn ensure_running(&self) -> Result<()> {
+        let cfg = self.current_config();
         let mut guard = self.inner.lock().await;
         if let Some(ref mut handle) = *guard {
-            // Check if process has exited
+            let config_changed = handle.sandbox_dir != cfg.sandbox_dir
+                || handle.configured_agy_path != cfg.configured_agy_path;
             match handle.child.try_wait() {
-                Ok(None) => {
-                    // Still running
+                Ok(None) if !config_changed => {
                     return Ok(());
                 }
+                Ok(None) => {
+                    // Settings changed: recycle idle process so new agy_path / sandbox takes effect.
+                    if self.active_sessions.lock().await.is_empty() {
+                        if let Some(mut old) = guard.take() {
+                            let _ = old.child.kill().await;
+                        }
+                        let mut t = self.telemetry.lock().unwrap();
+                        t.acp_running = false;
+                        t.acp_initialized = false;
+                    } else {
+                        return Ok(());
+                    }
+                }
                 _ => {
-                    // Terminated; clear and respawn
                     *guard = None;
+                    let mut t = self.telemetry.lock().unwrap();
+                    t.acp_running = false;
+                    t.acp_initialized = false;
                 }
             }
         }
@@ -212,20 +303,28 @@ impl AntigravityClient {
             bail!("Antigravity client is shutting down");
         }
 
-        let agy_bin = find_agy_path(self.configured_agy_path.as_deref())?;
-        std::fs::create_dir_all(&self.sandbox_dir)
+        let agy_bin = find_agy_path(cfg.configured_agy_path.as_deref())?;
+        std::fs::create_dir_all(&cfg.sandbox_dir)
             .context("Failed to create Antigravity sandbox directory")?;
 
         let mut cmd = Command::new(&agy_bin);
         cmd.arg("acp")
-            .current_dir(&self.sandbox_dir)
+            .current_dir(&cfg.sandbox_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
 
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn agy acp process at {:?}", agy_bin))?;
+
+        {
+            let mut t = self.telemetry.lock().unwrap();
+            t.acp_running = true;
+            t.acp_initialized = false;
+        }
 
         let stdin = child
             .stdin
@@ -238,6 +337,7 @@ impl AntigravityClient {
 
         let pending_map = self.pending_requests.clone();
         let sessions_map = self.active_sessions.clone();
+        let telemetry_on_exit = self.telemetry.clone();
 
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(128);
         let mut child_stdin = stdin;
@@ -338,6 +438,10 @@ impl AntigravityClient {
             for (_, s) in sessions.drain() {
                 let _ = s.sender.send(AcpUpdate::Error("ACP process closed".into()));
             }
+            let mut t = telemetry_on_exit.lock().unwrap();
+            t.acp_running = false;
+            t.acp_initialized = false;
+            t.active_sessions = 0;
         });
 
         // Store child handle
@@ -345,6 +449,8 @@ impl AntigravityClient {
             child,
             stdin_tx,
             initialized: false,
+            sandbox_dir: cfg.sandbox_dir,
+            configured_agy_path: cfg.configured_agy_path,
         });
 
         drop(guard);
@@ -358,12 +464,23 @@ impl AntigravityClient {
             }
         });
 
-        self.call("initialize", init_params).await?;
+        if let Err(err) = self.call("initialize", init_params).await {
+            let mut guard = self.inner.lock().await;
+            if let Some(mut handle) = guard.take() {
+                let _ = handle.child.kill().await;
+            }
+            let mut t = self.telemetry.lock().unwrap();
+            t.acp_running = false;
+            t.acp_initialized = false;
+            t.last_error = Some(err.to_string());
+            return Err(err);
+        }
 
         let mut guard = self.inner.lock().await;
         if let Some(ref mut handle) = *guard {
             handle.initialized = true;
         }
+        self.telemetry.lock().unwrap().acp_initialized = true;
 
         Ok(())
     }
@@ -442,6 +559,7 @@ impl AntigravityClient {
     /// Creates a new ACP session with custom model and optional system prompt extension.
     pub async fn new_session(&self, model: &str, system_prompt: Option<&str>) -> Result<String> {
         self.ensure_running().await?;
+        let sandbox_dir = self.current_config().sandbox_dir;
 
         let meta = json!({
             "antigravity": {
@@ -452,7 +570,7 @@ impl AntigravityClient {
         });
 
         let session_params = json!({
-            "cwd": self.sandbox_dir.to_string_lossy(),
+            "cwd": sandbox_dir.to_string_lossy(),
             "mcpServers": [],
             "_meta": meta
         });
@@ -466,7 +584,7 @@ impl AntigravityClient {
         // Switch to the requested model if different
         let current_model = res["models"]["currentModelId"].as_str().unwrap_or("");
         if !model.is_empty() && model != current_model {
-            let _ = self
+            if let Err(err) = self
                 .call(
                     "session/set_model",
                     json!({
@@ -474,7 +592,13 @@ impl AntigravityClient {
                         "modelId": model
                     }),
                 )
-                .await;
+                .await
+            {
+                let _ = self
+                    .call("session/close", json!({ "sessionId": &session_id }))
+                    .await;
+                return Err(err).context(format!("Failed to select Antigravity model '{model}'"));
+            }
         }
 
         Ok(session_id)
@@ -495,6 +619,7 @@ impl AntigravityClient {
                 session_id.to_owned(),
                 SessionChannels { sender: tx.clone() },
             );
+            self.telemetry.lock().unwrap().active_sessions = sessions.len() as u64;
         }
 
         let sid = session_id.to_owned();
@@ -525,6 +650,7 @@ impl AntigravityClient {
             // Cleanup session from active map
             let mut sessions = client.active_sessions.lock().await;
             sessions.remove(&sid);
+            client.telemetry.lock().unwrap().active_sessions = sessions.len() as u64;
 
             // Cleanly close ACP session to conserve quota and avoid history clutter
             let _ = client
@@ -588,6 +714,29 @@ impl AntigravityClient {
         }
     }
 
+    /// Restarts/recycles the idle ACP child process without stopping the HTTP server.
+    pub async fn restart_if_idle(&self) -> Result<bool> {
+        let mut guard = self.inner.lock().await;
+        let active = self.active_sessions.lock().await.len();
+        if active > 0 {
+            bail!(
+                "Cannot restart Antigravity ACP worker while {active} request(s) are in flight"
+            );
+        }
+        let stopped = if let Some(mut handle) = guard.take() {
+            let _ = handle.child.kill().await;
+            true
+        } else {
+            false
+        };
+        let mut t = self.telemetry.lock().unwrap();
+        t.acp_running = false;
+        t.acp_initialized = false;
+        t.active_sessions = 0;
+        t.last_error = None;
+        Ok(stopped)
+    }
+
     /// Graceful termination: terminates child process cleanly.
     pub async fn shutdown(&self) {
         self.is_shutting_down.store(true, Ordering::SeqCst);
@@ -595,16 +744,113 @@ impl AntigravityClient {
         if let Some(mut handle) = guard.take() {
             let _ = handle.child.kill().await;
         }
+        let mut t = self.telemetry.lock().unwrap();
+        t.acp_running = false;
+        t.acp_initialized = false;
+        t.active_sessions = 0;
     }
 }
 
 /// Global shared singleton client for the application runtime.
 static GLOBAL_ANTIGRAVITY: OnceLock<Arc<AntigravityClient>> = OnceLock::new();
 
+/// Resolves Antigravity sandbox directory and optional `agy.exe` override from settings.
+pub fn configured_paths(settings: &Value, root: &Path) -> (PathBuf, Option<String>) {
+    let configured_path = settings["antigravity"]["agy_path"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let sandbox_dir = settings["antigravity"]["sandbox_dir"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let p = PathBuf::from(s);
+            if p.is_relative() {
+                root.join(p)
+            } else {
+                p
+            }
+        })
+        .unwrap_or_else(|| root.join("agy-sandbox"));
+    (sandbox_dir, configured_path)
+}
+
 pub fn get_client(sandbox_dir: PathBuf, agy_path: Option<String>) -> Arc<AntigravityClient> {
-    GLOBAL_ANTIGRAVITY
-        .get_or_init(|| Arc::new(AntigravityClient::new(sandbox_dir, agy_path)))
-        .clone()
+    let client = GLOBAL_ANTIGRAVITY
+        .get_or_init(|| Arc::new(AntigravityClient::new(sandbox_dir.clone(), agy_path.clone())))
+        .clone();
+    client.update_config(sandbox_dir, agy_path);
+    client
+}
+
+/// Records an external completion outcome (e.g. from Bard lyric drafting) into telemetry.
+pub fn record_outcome(model: &str, elapsed: Duration, error: Option<&str>) {
+    if let Some(client) = GLOBAL_ANTIGRAVITY.get() {
+        client.record_outcome(model, elapsed, error);
+    }
+}
+
+/// Restarts the global ACP child worker if idle; keeps the HTTP server listening.
+pub async fn restart_global() -> Result<Value> {
+    let was_running = if let Some(client) = GLOBAL_ANTIGRAVITY.get() {
+        client.restart_if_idle().await?
+    } else {
+        false
+    };
+    Ok(json!({
+        "success": true,
+        "restarted": was_running,
+        "message": if was_running {
+            "Stopped idle Antigravity ACP worker; a fresh agy acp process will start on the next request"
+        } else {
+            "Antigravity ACP worker was already idle; ready for the next request"
+        }
+    }))
+}
+
+/// Gracefully shuts down the global ACP child process if running.
+pub async fn shutdown_global() {
+    if let Some(client) = GLOBAL_ANTIGRAVITY.get() {
+        client.shutdown().await;
+    }
+}
+
+/// Builds a non-blocking sanitized telemetry snapshot for `GET /health`.
+pub fn health_snapshot(settings: &Value, root: &Path) -> Value {
+    let (sandbox_dir, configured_path) = configured_paths(settings, root);
+    let agy_lookup = find_agy_path(configured_path.as_deref());
+    let configured_model = settings["antigravity"]["model"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_ANTIGRAVITY_MODEL);
+    let resolved_effort = resolve_effort(None, settings);
+    let resolved_model = resolve_model(None, Some(resolved_effort), settings);
+    let telemetry = GLOBAL_ANTIGRAVITY
+        .get()
+        .map(|c| c.telemetry.lock().unwrap().clone())
+        .unwrap_or_default();
+
+    json!({
+        "configured_model": configured_model,
+        "resolved_model": resolved_model,
+        "effort": resolved_effort,
+        "agy_found": agy_lookup.is_ok(),
+        "agy_path": agy_lookup.as_ref().ok().map(|p| p.to_string_lossy().into_owned()),
+        "agy_error": agy_lookup.err().map(|e| e.to_string()),
+        "sandbox_dir": sandbox_dir.to_string_lossy(),
+        "acp_running": telemetry.acp_running,
+        "acp_initialized": telemetry.acp_initialized,
+        "active_sessions": telemetry.active_sessions,
+        "total_requests": telemetry.total_requests,
+        "failed_requests": telemetry.failed_requests,
+        "last_latency_ms": telemetry.last_latency_ms,
+        "last_model": telemetry.last_model,
+        "last_error": telemetry.last_error,
+        "last_completed_at": telemetry.last_completed_at,
+    })
 }
 
 /// Translates OpenAI Chat Completion messages into an ACP system instruction and prompt blocks.
@@ -742,6 +988,7 @@ pub async fn handle_chat_completion(
     settings: &Value,
     root: PathBuf,
 ) -> Result<Response<Body>> {
+    let started = Instant::now();
     let stream = payload["stream"].as_bool().unwrap_or(false);
     let messages = payload["messages"]
         .as_array()
@@ -753,15 +1000,7 @@ pub async fn handle_chat_completion(
     let resolved_model = resolve_model(payload_model, payload_effort, settings);
     let target_model = &resolved_model;
 
-    let configured_path = settings["antigravity"]["agy_path"]
-        .as_str()
-        .map(str::to_owned);
-
-    let sandbox_dir = settings["antigravity"]["sandbox_dir"]
-        .as_str()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("agy-sandbox"));
-
+    let (sandbox_dir, configured_path) = configured_paths(settings, &root);
     let client = get_client(sandbox_dir, configured_path);
 
     // Convert messages
@@ -771,6 +1010,7 @@ pub async fn handle_chat_completion(
     let session_id = match client.new_session(target_model, system_prompt.as_deref()).await {
         Ok(sid) => sid,
         Err(e) => {
+            client.record_error_only(Some(target_model), &e.to_string());
             return Ok(json_response(
                 &json!({
                     "error": format!("Antigravity session initialization failed: {}", e),
@@ -789,6 +1029,7 @@ pub async fn handle_chat_completion(
         let rx = match client.clone().prompt_stream(&session_id, prompt_blocks).await {
             Ok(rx) => rx,
             Err(e) => {
+                client.record_error_only(Some(target_model), &e.to_string());
                 return Ok(json_response(
                     &json!({
                         "error": format!("Antigravity prompt stream failed: {}", e),
@@ -799,9 +1040,10 @@ pub async fn handle_chat_completion(
             }
         };
 
+        let telemetry_client = client.clone();
         let stream = futures_util::stream::unfold(
-            (rx, model_name, created_ts, false),
-            move |(mut rx, model, created, finished)| async move {
+            (rx, model_name, created_ts, false, telemetry_client, started),
+            move |(mut rx, model, created, finished, telemetry_client, started)| async move {
                 if finished {
                     return None;
                 }
@@ -822,10 +1064,11 @@ pub async fn handle_chat_completion(
                             let line = format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default());
                             return Some((
                                 Ok::<_, BoxError>(Frame::data(Bytes::from(line))),
-                                (rx, model, created, false),
+                                (rx, model, created, false, telemetry_client, started),
                             ));
                         }
                         AcpUpdate::Completed => {
+                            telemetry_client.record_outcome(&model, started.elapsed(), None);
                             let final_chunk = json!({
                                 "id": format!("chatcmpl-{}", created),
                                 "object": "chat.completion.chunk",
@@ -843,11 +1086,11 @@ pub async fn handle_chat_completion(
                             );
                             return Some((
                                 Ok::<_, BoxError>(Frame::data(Bytes::from(finish_data))),
-                                (rx, model, created, true),
+                                (rx, model, created, true, telemetry_client, started),
                             ));
                         }
-                        AcpUpdate::Error(_) => {
-                            // On error, terminate stream
+                        AcpUpdate::Error(err) => {
+                            telemetry_client.record_outcome(&model, started.elapsed(), Some(&err));
                             return None;
                         }
                         _ => {}
@@ -877,6 +1120,7 @@ pub async fn handle_chat_completion(
 
         match res {
             Ok((full_text, full_thought, usage)) => {
+                client.record_outcome(&model_name, started.elapsed(), None);
                 let mut message = json!({
                     "role": "assistant",
                     "content": full_text
@@ -898,13 +1142,17 @@ pub async fn handle_chat_completion(
                 });
                 Ok(json_response(&completion, StatusCode::OK))
             }
-            Err(e) => Ok(json_response(
-                &json!({
-                    "error": format!("Antigravity completion failed: {}", e),
-                    "code": "antigravity_completion_failed"
-                }),
-                StatusCode::BAD_GATEWAY,
-            )),
+            Err(e) => {
+                let msg = e.to_string();
+                client.record_outcome(&model_name, started.elapsed(), Some(&msg));
+                Ok(json_response(
+                    &json!({
+                        "error": format!("Antigravity completion failed: {}", msg),
+                        "code": "antigravity_completion_failed"
+                    }),
+                    StatusCode::BAD_GATEWAY,
+                ))
+            }
         }
     }
 }
@@ -985,5 +1233,27 @@ mod tests {
         assert_eq!(resolve_model(None, None, &custom_settings), "gemini-4-argon-high");
         assert_eq!(resolve_model(None, Some("low"), &custom_settings), "gemini-4-argon-low");
         assert_eq!(resolve_model(Some("claude-opus-5-5-high"), None, &custom_settings), "claude-opus-5-5-high");
+
+        let gpt_oss_settings = json!({
+            "antigravity": {
+                "model": "gpt-oss-120b-medium",
+                "effort": "low"
+            }
+        });
+        assert_eq!(resolve_model(None, None, &gpt_oss_settings), "gpt-oss-120b-medium");
+    }
+
+    #[test]
+    fn test_configured_paths_ignores_blank_strings() {
+        let root = PathBuf::from(r"D:\example\root");
+        let s = json!({
+            "antigravity": {
+                "agy_path": "  ",
+                "sandbox_dir": ""
+            }
+        });
+        let (sandbox, agy) = configured_paths(&s, &root);
+        assert_eq!(sandbox, root.join("agy-sandbox"));
+        assert!(agy.is_none());
     }
 }

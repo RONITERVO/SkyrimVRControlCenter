@@ -117,6 +117,12 @@ impl Service {
             let mut nr_status = crate::nr_guard::status(config.nr_guard.as_ref());
             let mut kat_stub_status = crate::kat::stub_status(&root);
             let mut shader_cache_status = crate::shader_cache::status(shader_cfg.as_ref());
+            let mut skyrimnet_route_status = crate::skyrimnet_route::status(&config, &root);
+            let mut antigravity_cli_status = config
+                .music_settings()
+                .map(|s| crate::antigravity_cli::cli_status(&s))
+                .unwrap_or_else(|_| json!({"found": false}));
+            let mut antigravity_models = crate::antigravity_cli::default_models_json();
             let mut was_precompiling = false;
             if !preview {
                 match start_music(&config, &root) {
@@ -156,6 +162,12 @@ impl Service {
                         Ok(v) => v["message"].as_str().unwrap_or("Done").to_owned(),
                         Err(e) => format!("Action stopped: {e}"),
                     };
+                    if req.action == "antigravity-refresh-models"
+                        && let Ok(ref v) = result
+                        && v["models"].is_array()
+                    {
+                        antigravity_models = v["models"].clone();
+                    }
                     if matches!(
                         req.action.as_str(),
                         "nr-disable"
@@ -167,6 +179,11 @@ impl Service {
                             | "shader-cache-enforce-settings"
                             | "shader-precompile-start"
                             | "shader-precompile-cancel"
+                            | "music-save"
+                            | "antigravity-restart"
+                            | "antigravity-refresh-models"
+                            | "skyrimnet-switch-antigravity"
+                            | "skyrimnet-restore-openrouter"
                     ) {
                         last_refresh = Instant::now() - Duration::from_secs(4);
                     }
@@ -195,6 +212,11 @@ impl Service {
                     nr_status = crate::nr_guard::status(config.nr_guard.as_ref());
                     kat_stub_status = crate::kat::stub_status(&root);
                     shader_cache_status = crate::shader_cache::status(shader_cfg.as_ref());
+                    skyrimnet_route_status = crate::skyrimnet_route::status(&config, &root);
+                    antigravity_cli_status = config
+                        .music_settings()
+                        .map(|s| crate::antigravity_cli::cli_status(&s))
+                        .unwrap_or_else(|_| json!({"found": false}));
                     last_refresh = Instant::now();
                 }
                 let feedback_state = feedback_worker.status.lock().unwrap().clone();
@@ -214,6 +236,9 @@ impl Service {
                     let mut sc_merged = shader_cache_status.clone();
                     sc_merged["precompile"] = precompile_snap;
                     s["shaderCache"] = sc_merged;
+                    s["skyrimnetRoute"] = skyrimnet_route_status.clone();
+                    s["antigravityCli"] = antigravity_cli_status.clone();
+                    s["antigravityModels"] = antigravity_models.clone();
                 }
                 thread::sleep(Duration::from_millis(200));
             }
@@ -320,6 +345,10 @@ fn launch_session(c: &Config) -> Result<Value> {
     }
     Ok(json!({"message":message,"results":results}))
 }
+fn bard_token(c: &Config) -> Result<String> {
+    fs::read_to_string(c.music_root.join("data/native-adapter-token.txt"))
+        .map_err(|_| "Local music credential is unavailable".to_string())
+}
 fn perform(
     action: &str,
     body: &Value,
@@ -339,6 +368,8 @@ fn perform(
                 | "shader-cache-clear"
                 | "shader-cache-restore"
                 | "shader-cache-enforce-settings"
+                | "skyrimnet-switch-antigravity"
+                | "skyrimnet-restore-openrouter"
                 | "feedback-start"
                 | "feedback-test"
         )
@@ -377,8 +408,7 @@ fn perform(
         | "music-downloads-task"
         | "music-downloads-recover"
         | "music-downloads-credits" => {
-            let token = fs::read_to_string(c.music_root.join("data/native-adapter-token.txt"))
-                .map_err(|_| "Local music credential unavailable")?;
+            let token = bard_token(c)?;
             let endpoint = match action {
                 "music-downloads-task" => "/archive/task",
                 "music-downloads-recover" => "/archive/recover",
@@ -392,13 +422,70 @@ fn perform(
             let current = c.music_settings()?;
             let next = config::patch_music(&current, body)?;
             config::write_json(&c.music_root.join("settings.json"), &next)?;
-            Ok(
-                json!({"message":"Song preferences saved for the next native request; no generation started"}),
+            let msg = if body.get("antigravity").is_some() || body.get("llm_backend").is_some() {
+                "LLM / Antigravity preferences saved for the next request"
+            } else {
+                "Song preferences saved for the next native request; no generation started"
+            };
+            Ok(json!({"message": msg}))
+        }
+        "antigravity-refresh-models" => {
+            let settings = c.music_settings()?;
+            let configured = body["agy_path"]
+                .as_str()
+                .or_else(|| settings["antigravity"]["agy_path"].as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let models = crate::antigravity_cli::discover_models(configured)?;
+            let count = models.len();
+            Ok(json!({
+                "models": crate::antigravity_cli::models_to_json(&models),
+                "message": format!("Loaded {count} available models from agy.exe")
+            }))
+        }
+        "antigravity-restart" => {
+            let token = bard_token(c)?;
+            http::request(
+                8097,
+                "POST",
+                "/controls/antigravity-restart",
+                Some(&json!({})),
+                Some(&token),
             )
         }
+        "antigravity-open-sandbox" => {
+            let settings = c.music_settings()?;
+            let sandbox = settings["antigravity"]["sandbox_dir"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| config::resolve_path(&c.music_root, Path::new(s)))
+                .unwrap_or_else(|| c.music_root.join("agy-sandbox"));
+            fs::create_dir_all(&sandbox)
+                .map_err(|e| format!("Cannot create Antigravity sandbox folder: {e}"))?;
+            platform::open(&sandbox.to_string_lossy())?;
+            Ok(json!({"message": "Antigravity sandbox folder opened"}))
+        }
+        "skyrimnet-switch-antigravity" => crate::skyrimnet_route::switch_to_antigravity(c, root),
+        "skyrimnet-restore-openrouter" => crate::skyrimnet_route::restore_openrouter(c, root),
+        "skyrimnet-open-config" => {
+            let dir = c
+                .effective_skyrimnet_config_dir()
+                .ok_or("SkyrimNet config folder is not configured")?;
+            if !dir.is_dir() {
+                return Err(format!("SkyrimNet config folder not found: {}", dir.display()));
+            }
+            platform::open(&dir.to_string_lossy())?;
+            Ok(json!({"message": "SkyrimNet config folder opened"}))
+        }
+        "skyrimnet-open-backups" => {
+            let dir = root.join("backups");
+            fs::create_dir_all(&dir).map_err(|e| format!("Cannot open backups folder: {e}"))?;
+            platform::open(&dir.to_string_lossy())?;
+            Ok(json!({"message": "Backups folder opened"}))
+        }
         "music-pause" | "music-arm-one" => {
-            let token = fs::read_to_string(c.music_root.join("data/native-adapter-token.txt"))
-                .map_err(|_| "Local music credential is unavailable".to_string())?;
+            let token = bard_token(c)?;
             let endpoint = if action == "music-pause" {
                 "/controls/cancel-allowance"
             } else {

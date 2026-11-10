@@ -3,6 +3,7 @@
   "lyrics_provider": "antigravity",
   "antigravity": {
     "model": "gemini-3.8-flash-low",
+    "effort": "low",
     "agy_path": null,
     "sandbox_dir": null
   },
