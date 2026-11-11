@@ -901,7 +901,7 @@ mod job {
     pub fn bind_to_relay_lifetime(child: &tokio::process::Child) {
         if let (Some(job), Some(raw)) = (job_handle(), child.raw_handle()) {
             unsafe {
-                AssignProcessToJobObject(job as *mut core::ffi::c_void, raw as *mut core::ffi::c_void);
+                AssignProcessToJobObject(job as *mut core::ffi::c_void, raw);
             }
         }
     }

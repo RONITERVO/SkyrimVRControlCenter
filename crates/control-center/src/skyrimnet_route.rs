@@ -138,10 +138,13 @@ pub fn rewrite_openrouter_to_local(yaml_text: &str) -> (String, usize) {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProviderSlot {
     line: usize,
+    parent: String,
     /// Ancestor mapping keys plus the ordinal among provider entries under them,
     /// e.g. `openrouter/variants/AgentDefault/model_params#0`.
     key: String,
     id: String,
+    /// Normalized non-`provider_id` fields belonging to this YAML sequence item.
+    signature: Vec<String>,
 }
 
 fn mapping_key(content: &str) -> Option<String> {
@@ -157,12 +160,28 @@ fn mapping_key(content: &str) -> Option<String> {
     Some(key.trim_matches(|c| c == '"' || c == '\'').to_owned())
 }
 
-/// Locates every provider slot by indentation-derived path, so slots can be matched
-/// between two versions of the file even when entries were added or edited.
+fn normalize_item_field(rel_indent: usize, trimmed: &str) -> String {
+    if let Some((k, v)) = trimmed.split_once(':') {
+        let key = k.trim();
+        let val = v.trim();
+        if val.is_empty() {
+            format!("{rel_indent}:{key}:")
+        } else {
+            format!("{rel_indent}:{key}: {val}")
+        }
+    } else {
+        format!("{rel_indent}:{trimmed}")
+    }
+}
+
+/// Locates every provider slot by indentation-derived path and sibling item fields, so
+/// moved slots can be matched or ambiguous list edits detected across YAML versions.
 fn provider_slots(yaml_text: &str) -> Vec<ProviderSlot> {
     let mut stack: Vec<(usize, String)> = Vec::new();
     let mut ordinals: HashMap<String, usize> = HashMap::new();
-    let mut slots = Vec::new();
+    let mut slots: Vec<ProviderSlot> = Vec::new();
+    let mut active_item_indent: Option<usize> = None;
+
     for (idx, raw) in yaml_text.lines().enumerate() {
         let body = raw.trim_end();
         let trimmed = body.trim_start();
@@ -170,6 +189,16 @@ fn provider_slots(yaml_text: &str) -> Vec<ProviderSlot> {
             continue;
         }
         let indent = body.len() - trimmed.len();
+        if let Some(item_indent) = active_item_indent {
+            if indent > item_indent {
+                if let Some(last) = slots.last_mut() {
+                    last.signature
+                        .push(normalize_item_field(indent - item_indent, trimmed));
+                }
+            } else {
+                active_item_indent = None;
+            }
+        }
         while stack.last().is_some_and(|(i, _)| *i >= indent) {
             stack.pop();
         }
@@ -189,10 +218,13 @@ fn provider_slots(yaml_text: &str) -> Vec<ProviderSlot> {
             let ordinal = ordinals.entry(parent.clone()).or_insert(0);
             slots.push(ProviderSlot {
                 line: idx,
+                parent: parent.clone(),
                 key: format!("{parent}#{ordinal}"),
                 id: id.to_owned(),
+                signature: Vec::new(),
             });
             *ordinal += 1;
+            active_item_indent = Some(indent);
         }
         if let Some(key) = mapping_key(content) {
             stack.push((content_indent, key));
@@ -208,31 +240,157 @@ pub struct RestorePlan {
     pub reverted: usize,
     /// `local_bard_composer` slots that do not exist in the backup (left untouched).
     pub unmatched_local: usize,
+    /// Parent paths where `model_params` entries changed ambiguously and were left untouched.
+    pub ambiguous_groups: Vec<String>,
+}
+
+fn plan_parent_group(
+    b_slots: &[&ProviderSlot],
+    l_slots: &[&ProviderSlot],
+    targets: &mut HashSet<usize>,
+    unmatched_local: &mut usize,
+) -> bool {
+    if b_slots.is_empty() {
+        *unmatched_local += l_slots.iter().filter(|s| s.id == LOCAL_ID).count();
+        return false;
+    }
+
+    if l_slots.len() == b_slots.len()
+        && b_slots
+            .iter()
+            .zip(l_slots.iter())
+            .all(|(b, l)| b.signature == l.signature)
+    {
+        for (b, l) in b_slots.iter().zip(l_slots.iter()) {
+            if l.id == LOCAL_ID && b.id == OPENROUTER_ID {
+                targets.insert(l.line);
+            }
+        }
+        return false;
+    }
+
+    if b_slots.iter().all(|b| b.id != OPENROUTER_ID) {
+        let b_local = b_slots.iter().filter(|b| b.id == LOCAL_ID).count();
+        let l_local = l_slots.iter().filter(|l| l.id == LOCAL_ID).count();
+        *unmatched_local += l_local.saturating_sub(b_local);
+        return false;
+    }
+
+    // List length or item signatures changed under this parent; group by item fields.
+    let mut b_by_sig: HashMap<&[String], Vec<&ProviderSlot>> = HashMap::new();
+    let mut l_by_sig: HashMap<&[String], Vec<&ProviderSlot>> = HashMap::new();
+    let mut signatures: Vec<&[String]> = Vec::new();
+    for b in b_slots {
+        let sig = b.signature.as_slice();
+        if !b_by_sig.contains_key(sig) {
+            signatures.push(sig);
+        }
+        b_by_sig.entry(sig).or_default().push(b);
+    }
+    for l in l_slots {
+        let sig = l.signature.as_slice();
+        if !b_by_sig.contains_key(sig) && !l_by_sig.contains_key(sig) {
+            signatures.push(sig);
+        }
+        l_by_sig.entry(sig).or_default().push(l);
+    }
+
+    let mut candidate_targets = Vec::new();
+    let mut added_unbacked_local = 0usize;
+    let mut missing_backup_open = 0usize;
+    let mut ambiguous = false;
+
+    for sig in signatures {
+        let bb = b_by_sig.get(sig).map(Vec::as_slice).unwrap_or(&[]);
+        let lb = l_by_sig.get(sig).map(Vec::as_slice).unwrap_or(&[]);
+        let b_open = bb.iter().filter(|b| b.id == OPENROUTER_ID).count();
+        let b_other = bb.len() - b_open;
+        let l_local: Vec<usize> = lb
+            .iter()
+            .filter(|l| l.id == LOCAL_ID)
+            .map(|l| l.line)
+            .collect();
+        let l_other = lb.len() - l_local.len();
+
+        if bb.is_empty() {
+            added_unbacked_local += l_local.len();
+        } else if b_open == 0 {
+            let b_local = bb.iter().filter(|b| b.id == LOCAL_ID).count();
+            added_unbacked_local += l_local.len().saturating_sub(b_local);
+        } else if b_other == 0 && l_other == 0 && l_local.len() <= b_open {
+            if l_local.len() < b_open {
+                missing_backup_open += b_open - l_local.len();
+            }
+            candidate_targets.extend(l_local);
+        } else if lb.len() == bb.len()
+            && bb
+                .iter()
+                .zip(lb.iter())
+                .all(|(b, l)| b.id == l.id || (b.id == OPENROUTER_ID && l.id == LOCAL_ID))
+        {
+            for (b, l) in bb.iter().zip(lb.iter()) {
+                if b.id == OPENROUTER_ID && l.id == LOCAL_ID {
+                    candidate_targets.push(l.line);
+                }
+            }
+        } else {
+            ambiguous = true;
+            break;
+        }
+    }
+
+    if ambiguous || (missing_backup_open > 0 && added_unbacked_local > 0) {
+        return true;
+    }
+
+    targets.extend(candidate_targets);
+    *unmatched_local += added_unbacked_local;
+    false
 }
 
 /// Reverts only the slots that were `openrouter` in the backup and are
-/// `local_bard_composer` now. All other edits made since the switch are preserved.
+/// `local_bard_composer` now. Distinguishes moved entries by sibling item fields and
+/// refuses to rewrite groups whose list changes are ambiguous.
 pub fn plan_restore(live: &str, backup: &str) -> RestorePlan {
-    let backup_ids: HashMap<String, String> = provider_slots(backup)
-        .into_iter()
-        .map(|s| (s.key, s.id))
-        .collect();
+    let backup_slots = provider_slots(backup);
+    let live_slots = provider_slots(live);
+
+    let mut parent_order: Vec<String> = Vec::new();
+    let mut b_by_parent: HashMap<&str, Vec<&ProviderSlot>> = HashMap::new();
+    let mut l_by_parent: HashMap<&str, Vec<&ProviderSlot>> = HashMap::new();
+    for b in &backup_slots {
+        if !b_by_parent.contains_key(b.parent.as_str()) {
+            parent_order.push(b.parent.clone());
+        }
+        b_by_parent.entry(b.parent.as_str()).or_default().push(b);
+    }
+    for l in &live_slots {
+        if !b_by_parent.contains_key(l.parent.as_str())
+            && !l_by_parent.contains_key(l.parent.as_str())
+        {
+            parent_order.push(l.parent.clone());
+        }
+        l_by_parent.entry(l.parent.as_str()).or_default().push(l);
+    }
+
     let mut targets = HashSet::new();
     let mut unmatched_local = 0usize;
-    for slot in provider_slots(live).into_iter().filter(|s| s.id == LOCAL_ID) {
-        match backup_ids.get(&slot.key).map(String::as_str) {
-            Some(OPENROUTER_ID) => {
-                targets.insert(slot.line);
-            }
-            Some(_) => {}
-            None => unmatched_local += 1,
+    let mut ambiguous_groups = Vec::new();
+
+    for parent in parent_order {
+        let bs = b_by_parent.get(parent.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+        let ls = l_by_parent.get(parent.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+        if plan_parent_group(bs, ls, &mut targets, &mut unmatched_local) {
+            ambiguous_groups.push(parent);
         }
     }
+
     let (text, reverted) = rewrite_provider_lines(live, Some(&targets), LOCAL_ID, OPENROUTER_ID);
     RestorePlan {
         text,
         reverted,
         unmatched_local,
+        ambiguous_groups,
     }
 }
 
@@ -258,10 +416,10 @@ fn local_provider_endpoint(providers_text: &str) -> Option<String> {
         }
         if let Some(rest) = trimmed.strip_prefix('-') {
             let item = rest.trim_start();
-            if let Some(id) = item.strip_prefix("id:") {
-                if id.trim().trim_matches(|c| c == '"' || c == '\'') == LOCAL_ID {
-                    block_indent = Some(indent);
-                }
+            if let Some(id) = item.strip_prefix("id:")
+                && id.trim().trim_matches(|c| c == '"' || c == '\'') == LOCAL_ID
+            {
+                block_indent = Some(indent);
             }
         }
     }
@@ -540,6 +698,13 @@ pub fn restore_openrouter(cfg: &Config, root: &Path) -> Result<Value> {
         .to_string_lossy()
         .into_owned();
 
+    if !plan.ambiguous_groups.is_empty() {
+        return Err(format!(
+            "Refused to restore OpenRouter.yaml because provider list entries changed ambiguously under: {}. Reconcile those slots or restore manually from {backup_name}.",
+            plan.ambiguous_groups.join(", "),
+        ));
+    }
+
     if plan.reverted == 0 {
         return Ok(json!({
             "changed": 0,
@@ -750,6 +915,81 @@ mod tests {
         let again = restore_openrouter(&cfg, &root).unwrap();
         assert_eq!(again["changed"], 0);
         assert!(again.get("backupDir").is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_matches_moved_distinct_entries_when_local_inserted_or_removed() {
+        let backup = "openrouter:\n  variants:\n    Combat:\n      model_params:\n        - provider_id: openrouter\n          temperature: 1\n        - provider_id: local_bard_composer\n          temperature: 0.7\n";
+        let (switched, _) = rewrite_openrouter_to_local(backup);
+        // After switching, user prepends a new intentional local entry with distinct parameters.
+        let inserted = switched.replace(
+            "      model_params:\n",
+            "      model_params:\n        - provider_id: local_bard_composer\n          temperature: 0.5\n",
+        );
+        let plan_ins = plan_restore(&inserted, backup);
+        assert!(plan_ins.ambiguous_groups.is_empty());
+        assert_eq!(plan_ins.reverted, 1);
+        assert_eq!(plan_ins.unmatched_local, 1);
+        let ins_slots: Vec<String> = provider_slots(&plan_ins.text)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ins_slots, vec![LOCAL_ID, OPENROUTER_ID, LOCAL_ID]);
+
+        // Removing the first (switched) entry must not mistake the remaining intentional local entry for it.
+        let removed_first = "openrouter:\n  variants:\n    Combat:\n      model_params:\n        - provider_id: local_bard_composer\n          temperature: 0.7\n";
+        let plan_rem = plan_restore(removed_first, backup);
+        assert!(plan_rem.ambiguous_groups.is_empty());
+        assert_eq!(plan_rem.reverted, 0);
+        assert_eq!(plan_rem.text, removed_first);
+    }
+
+    #[test]
+    fn restore_refuses_ambiguous_insertion_or_mixed_deletion_without_rewriting_file() {
+        // Indistinguishable items (no sibling fields): inserting a new local entry before switched Combat entries.
+        let (switched, _) = rewrite_openrouter_to_local(ORIGINAL);
+        let inserted_ambiguous = switched.replace(
+            "    Combat:\n      model_params:\n",
+            "    Combat:\n      model_params:\n        - provider_id: local_bard_composer\n",
+        );
+        let plan = plan_restore(&inserted_ambiguous, ORIGINAL);
+        assert_eq!(
+            plan.ambiguous_groups,
+            vec!["openrouter/variants/Combat/model_params"]
+        );
+        // AgentDefault is unambiguous, while Combat was refused and left untouched.
+        assert_eq!(plan.reverted, 1);
+        assert!(plan.text.contains("    Combat:\n      model_params:\n        - provider_id: local_bard_composer\n        - provider_id: local_bard_composer\n        - provider_id: local_bard_composer\n"));
+
+        // restore_openrouter must refuse the whole operation and leave the live file untouched.
+        let root = temp_dir("ambiguous-refuse");
+        let skyrimnet_cfg = root.join("skyrimnet/config");
+        fs::create_dir_all(&skyrimnet_cfg).unwrap();
+        let before_dir = root.join("backups/20261111-000000-before-antigravity");
+        fs::create_dir_all(&before_dir).unwrap();
+        fs::write(before_dir.join("OpenRouter.yaml"), ORIGINAL).unwrap();
+        fs::write(skyrimnet_cfg.join("OpenRouter.yaml"), &inserted_ambiguous).unwrap();
+        fs::write(skyrimnet_cfg.join("Providers.yaml"), "providers: []\n").unwrap();
+        let cfg = test_config(&root, &skyrimnet_cfg);
+
+        let err = restore_openrouter(&cfg, &root).unwrap_err();
+        assert!(err.contains("openrouter/variants/Combat/model_params"), "{err}");
+        assert_eq!(
+            fs::read_to_string(skyrimnet_cfg.join("OpenRouter.yaml")).unwrap(),
+            inserted_ambiguous
+        );
+
+        // Mixed identical fields in backup + deletion is also flagged ambiguous.
+        let mixed_backup = "openrouter:\n  variants:\n    Combat:\n      model_params:\n        - provider_id: local_bard_composer\n        - provider_id: openrouter\n";
+        let mixed_deleted = "openrouter:\n  variants:\n    Combat:\n      model_params:\n        - provider_id: local_bard_composer\n";
+        let plan_mixed = plan_restore(mixed_deleted, mixed_backup);
+        assert_eq!(
+            plan_mixed.ambiguous_groups,
+            vec!["openrouter/variants/Combat/model_params"]
+        );
+        assert_eq!(plan_mixed.reverted, 0);
 
         fs::remove_dir_all(root).unwrap();
     }
