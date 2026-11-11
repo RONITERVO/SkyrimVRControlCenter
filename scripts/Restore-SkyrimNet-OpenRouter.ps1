@@ -44,6 +44,14 @@ if (-not (Test-Path $sourceYaml)) {
 }
 
 $destYaml = Join-Path $SkyrimNetConfigDir "OpenRouter.yaml"
+
+# Safety backup of the current state before restoring
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$safetyBackupDir = Join-Path $repoRoot "backups\$timestamp-before-openrouter-restore"
+New-Item -ItemType Directory -Path $safetyBackupDir -Force | Out-Null
+Copy-Item -LiteralPath $destYaml -Destination (Join-Path $safetyBackupDir "OpenRouter.yaml") -Force
+Write-Host "Backed up current OpenRouter.yaml to: $safetyBackupDir" -ForegroundColor Gray
+
 Copy-Item -LiteralPath $sourceYaml -Destination $destYaml -Force
 
 Write-Host "Successfully restored OpenRouter.yaml from: $BackupPath" -ForegroundColor Green

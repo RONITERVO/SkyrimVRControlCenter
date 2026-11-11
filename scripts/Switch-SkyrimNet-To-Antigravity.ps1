@@ -3,8 +3,8 @@
     Safely routes SkyrimNet LLM variants to the local Antigravity relay on port 8097.
 
 .DESCRIPTION
-    1. Verifies that Skyrim VR, ModOrganizer, and skyrim-bard-engine are not running.
-    2. Backs up OpenRouter.yaml and Providers.yaml to backups/<timestamp>-before-antigravity/.
+    1. Verifies that Skyrim VR and ModOrganizer are not running.
+    2. Backs up OpenRouter.yaml to backups/<timestamp>-before-antigravity/. (Providers.yaml is untouched).
     3. Updates 'provider_id: openrouter' to 'provider_id: local_bard_composer' in OpenRouter.yaml,
        repointing all NPC dialogue, combat, evaluation, and vision slots to Antigravity.
     4. Leaves 'decisions' on 'openrouter_decisions' (cheap typesafe/jev model).
@@ -52,10 +52,7 @@ $backupDir = Join-Path $repoRoot "backups\$timestamp-before-antigravity"
 New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 
 Copy-Item -LiteralPath $openRouterYaml -Destination (Join-Path $backupDir "OpenRouter.yaml") -Force
-if (Test-Path $providersYaml) {
-    Copy-Item -LiteralPath $providersYaml -Destination (Join-Path $backupDir "Providers.yaml") -Force
-}
-Write-Host "Backed up original configuration to: $backupDir" -ForegroundColor Green
+Write-Host "Backed up original OpenRouter.yaml configuration to: $backupDir" -ForegroundColor Green
 
 # 4. Modify OpenRouter.yaml: replace 'provider_id: openrouter' with 'provider_id: local_bard_composer'
 # Note: Regex specifically targets exact "provider_id:\s*openrouter\s*$" so that "openrouter_decisions" is preserved!

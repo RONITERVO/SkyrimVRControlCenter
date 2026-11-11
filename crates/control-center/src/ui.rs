@@ -477,7 +477,7 @@ impl App {
                 PAGE_ANTIGRAVITY,
                 1310,
                 &["antigravity", "openrouter"],
-                settings["llm_backend"].as_str().unwrap_or("antigravity"),
+                settings["llm_backend"].as_str().unwrap_or("openrouter"),
                 260,
                 386,
                 190,
@@ -1098,7 +1098,7 @@ impl App {
             1382=>self.service.send("antigravity-restart",json!({})),
             1383=>self.service.send("antigravity-open-sandbox",json!({})),
             1384=>{
-                let approved=unsafe{MessageBoxW(self.hwnd,wide("Switch SkyrimNet OpenRouter.yaml routes to local Antigravity (127.0.0.1:8097)?\r\n\r\nRequires Skyrim VR and Mod Organizer 2 to be closed.\r\n• Backs up OpenRouter.yaml and Providers.yaml into backups/<timestamp>-before-antigravity/.\r\n• Updates 'provider_id: openrouter' slots to 'local_bard_composer'.\r\n• Keeps 'openrouter_decisions' untouched on OpenRouter.").as_ptr(),wide("Switch SkyrimNet Routes to Antigravity").as_ptr(),MB_YESNO|MB_ICONQUESTION)};
+                let approved=unsafe{MessageBoxW(self.hwnd,wide("Switch SkyrimNet OpenRouter.yaml routes to local Antigravity (127.0.0.1:8097)?\r\n\r\nRequires Skyrim VR and Mod Organizer 2 to be closed.\r\n• Backs up OpenRouter.yaml into backups/<timestamp>-before-antigravity/.\r\n• Updates 'provider_id: openrouter' slots to 'local_bard_composer'.\r\n• Keeps 'openrouter_decisions' untouched on OpenRouter.").as_ptr(),wide("Switch SkyrimNet Routes to Antigravity").as_ptr(),MB_YESNO|MB_ICONQUESTION)};
                 if approved==IDYES{self.service.send("skyrimnet-switch-antigravity",json!({}));}
             },
             1385=>{
@@ -1154,7 +1154,7 @@ impl App {
             let npc_backend = h["llm_backend"]
                 .as_str()
                 .or_else(|| m_cfg["llm_backend"].as_str())
-                .unwrap_or("antigravity");
+                .unwrap_or("openrouter");
             let lyrics_backend = h["lyrics_provider"]
                 .as_str()
                 .or_else(|| m_cfg["lyrics_provider"].as_str())
@@ -1213,7 +1213,7 @@ impl App {
         let npc_backend = h["llm_backend"]
             .as_str()
             .or_else(|| m_cfg["llm_backend"].as_str())
-            .unwrap_or("antigravity");
+            .unwrap_or("openrouter");
         let lyrics_backend = h["lyrics_provider"]
             .as_str()
             .or_else(|| m_cfg["lyrics_provider"].as_str())
