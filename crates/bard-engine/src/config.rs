@@ -91,7 +91,7 @@ pub fn validate(s: &Value) -> Result<()> {
     if provider != "openrouter" && provider != "antigravity" {
         bail!("Rust engine currently supports the selected OpenRouter or Antigravity workflows only");
     }
-    let backend = text(s, "llm_backend", "antigravity");
+    let backend = text(s, "llm_backend", "openrouter");
     if backend != "openrouter" && backend != "antigravity" {
         bail!("llm_backend must be openrouter or antigravity");
     }

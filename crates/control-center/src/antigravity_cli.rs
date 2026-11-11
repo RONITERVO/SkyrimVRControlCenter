@@ -175,7 +175,7 @@ pub fn discover_models(configured: Option<&str>) -> Result<Vec<(String, String)>
         buf
     });
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st,
@@ -183,8 +183,6 @@ pub fn discover_models(configured: Option<&str>) -> Result<Vec<(String, String)>
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = out_reader.join();
-                let _ = err_reader.join();
                 return Err("Timed out querying `agy models`".into());
             }
             Err(e) => return Err(format!("Failed waiting for agy models: {e}")),

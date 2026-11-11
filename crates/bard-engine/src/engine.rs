@@ -118,7 +118,7 @@ impl Engine {
         let polling = song_error.is_none()
             && flag(&s, "native_integration_enabled", true)
             && flag(&s, "native_real_interval_override", false);
-        let backend = text(&s, "llm_backend", "antigravity");
+        let backend = text(&s, "llm_backend", "openrouter");
         let lyrics_provider = text(&s, "lyrics_provider", "openrouter");
         let antigravity_info = crate::antigravity::health_snapshot(&s, &self.root);
         let openrouter_model = text(&s, "selected_model", "ready");
@@ -363,7 +363,7 @@ pub fn now() -> f64 {
 pub fn offline_status(root: &Path) -> Result<Value> {
     let s = read_settings(root)?;
     Ok(
-        json!({"runtime":"rust","version":env!("CARGO_PKG_VERSION"),"running":false,"llm_backend":text(&s,"llm_backend","antigravity"),"lyrics_provider":text(&s,"lyrics_provider","openrouter"),"antigravity":crate::antigravity::health_snapshot(&s,root),"selected_model":s["selected_model"],"thinking":s["reasoning_effort"],"include_history":flag(&s,"include_history",true),"native_spending_mode":s["native_spending_mode"],"native_suno_transport":"direct_https","controls_scope":"new_native_lyrics_only","automatic_secondary_capture":false,"native_configuration_modified":false}),
+        json!({"runtime":"rust","version":env!("CARGO_PKG_VERSION"),"running":false,"llm_backend":text(&s,"llm_backend","openrouter"),"lyrics_provider":text(&s,"lyrics_provider","openrouter"),"antigravity":crate::antigravity::health_snapshot(&s,root),"selected_model":s["selected_model"],"thinking":s["reasoning_effort"],"include_history":flag(&s,"include_history",true),"native_spending_mode":s["native_spending_mode"],"native_suno_transport":"direct_https","controls_scope":"new_native_lyrics_only","automatic_secondary_capture":false,"native_configuration_modified":false}),
     )
 }
 

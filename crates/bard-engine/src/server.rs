@@ -178,7 +178,7 @@ async fn handle(
             if !is_native_request(&payload) {
                 let root = engine.root.clone();
                 let s = blocking::run(move || read_settings(&root)).await?;
-                let backend = text(&s, "llm_backend", "antigravity");
+                let backend = text(&s, "llm_backend", "openrouter");
                 if backend == "antigravity" {
                     return crate::antigravity::handle_chat_completion(&payload, &s, engine.root.clone()).await;
                 }

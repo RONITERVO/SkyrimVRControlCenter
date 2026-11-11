@@ -249,19 +249,19 @@ pub async fn make_draft(
             );
             let messages = request["messages"].as_array().context("Invalid messages array")?;
             let (system_prompt, prompt_blocks) = crate::antigravity::openai_to_acp(messages)?;
-            let session_id = match client
+            let session = match client
                 .new_session(&resolved_model, system_prompt.as_deref())
                 .await
             {
-                Ok(sid) => sid,
+                Ok(session) => session,
                 Err(e) => {
                     client.record_outcome(&resolved_model, started.elapsed(), Some(&e.to_string()));
                     return Err(e);
                 }
             };
             let timeout_secs = num(&lyrics_s, "completion_timeout_seconds", 300.0);
-            let (full_text, _, usage) = match client
-                .prompt_buffered(&session_id, prompt_blocks, Duration::from_secs_f64(timeout_secs))
+            let crate::antigravity::BufferedCompletion { text: full_text, usage, .. } = match client
+                .prompt_buffered(session, prompt_blocks, Duration::from_secs_f64(timeout_secs))
                 .await
             {
                 Ok(ok) => {
